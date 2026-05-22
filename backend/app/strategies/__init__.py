@@ -9,7 +9,6 @@ from app.strategies.liquidity_sweep import LiquiditySweepStrategy
 from app.strategies.london_breakout import LondonBreakoutStrategy
 from app.strategies.momentum_continuation import MomentumContinuationStrategy
 from app.strategies.range_bounce import RangeBounceStrategy
-from app.strategies.us_open_breakout import USOpenBreakoutStrategy
 from app.strategies.vwap_reclaim import VWAPReclaimStrategy
 
 
@@ -23,7 +22,6 @@ def default_strategies():
     settings = get_settings()
     strategies = [
         AsiaContinuationStrategy(),
-        USOpenBreakoutStrategy(),
         VWAPReclaimStrategy(),
         BreakoutRetestStrategy(),
         LiquiditySweepStrategy(),
