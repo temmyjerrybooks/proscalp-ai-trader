@@ -22,7 +22,6 @@ def default_strategies():
     """
     settings = get_settings()
     strategies = [
-        LondonBreakoutStrategy(),
         AsiaContinuationStrategy(),
         USOpenBreakoutStrategy(),
         VWAPReclaimStrategy(),
@@ -32,6 +31,8 @@ def default_strategies():
         RangeBounceStrategy(),
         BTCLedAltcoinContinuationStrategy(),
     ]
+    if settings.london_open_breakout_enabled:
+        strategies.insert(0, LondonBreakoutStrategy())
     if settings.ema_pullback_enabled:
         strategies.append(EMAPullbackStrategy())
     return strategies

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from app.config.settings import get_settings
 from app.strategies.base_strategy import BaseStrategy, StrategyContext, StrategySignal
 
 
 class LondonBreakoutStrategy(BaseStrategy):
     name = "London open breakout"
 
+    def __init__(self, enabled: bool | None = None) -> None:
+        # Defaults to the settings flag; callers (backtests/tests) may force-enable.
+        self.enabled = get_settings().london_open_breakout_enabled if enabled is None else enabled
+
     def evaluate(self, context: StrategyContext) -> StrategySignal:
+        if not self.enabled:
+            return self.reject(context, ["London open breakout disabled by configuration"])
         candles = self.candles(context)
         snapshot = self.snapshot(context)
         if len(candles) < 30 or not snapshot:

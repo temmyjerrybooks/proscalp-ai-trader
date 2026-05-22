@@ -136,6 +136,7 @@ class Settings(BaseSettings):
     # Phase 2A — strategy enablement (disabled setups are dropped from the live
     # registry and self-reject in evaluate(); see docs/baseline-pre-phase-2a.md).
     ema_pullback_enabled: bool = False
+    london_open_breakout_enabled: bool = False
 
     asia_session_start_utc: str = "00:00"
     asia_session_end_utc: str = "04:00"
