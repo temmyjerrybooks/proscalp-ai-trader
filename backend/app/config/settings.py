@@ -133,6 +133,10 @@ class Settings(BaseSettings):
     off_session_timing_score: float = 65.0
     allow_unclear_regime_trading: bool = False
 
+    # Phase 2A — strategy enablement (disabled setups are dropped from the live
+    # registry and self-reject in evaluate(); see docs/baseline-pre-phase-2a.md).
+    ema_pullback_enabled: bool = False
+
     asia_session_start_utc: str = "00:00"
     asia_session_end_utc: str = "04:00"
     london_session_start_utc: str = "07:00"

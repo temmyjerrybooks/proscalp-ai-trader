@@ -1,5 +1,6 @@
 """Strategy implementations."""
 
+from app.config.settings import get_settings
 from app.strategies.asia_continuation import AsiaContinuationStrategy
 from app.strategies.btc_led_altcoin import BTCLedAltcoinContinuationStrategy
 from app.strategies.breakout_retest import BreakoutRetestStrategy
@@ -13,15 +14,24 @@ from app.strategies.vwap_reclaim import VWAPReclaimStrategy
 
 
 def default_strategies():
-    return [
+    """Active strategies for the live bot.
+
+    Strategies disabled via settings flags (Phase 2A) are dropped from this
+    registry so they are never evaluated or persisted. They remain importable
+    for backtesting/tests via direct construction with enabled=True.
+    """
+    settings = get_settings()
+    strategies = [
         LondonBreakoutStrategy(),
         AsiaContinuationStrategy(),
         USOpenBreakoutStrategy(),
         VWAPReclaimStrategy(),
-        EMAPullbackStrategy(),
         BreakoutRetestStrategy(),
         LiquiditySweepStrategy(),
         MomentumContinuationStrategy(),
         RangeBounceStrategy(),
         BTCLedAltcoinContinuationStrategy(),
     ]
+    if settings.ema_pullback_enabled:
+        strategies.append(EMAPullbackStrategy())
+    return strategies

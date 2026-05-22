@@ -33,7 +33,7 @@ class BacktestRequest(BaseModel):
 async def run_backtest(payload: BacktestRequest, db: AsyncSession = Depends(get_db)) -> dict:
     strategy = next(
         (item for item in default_strategies() if item.name == payload.strategy),
-        EMAPullbackStrategy(),
+        EMAPullbackStrategy(enabled=True),  # backtests evaluate the setup regardless of live enablement
     )
     adapter = create_exchange_adapter()
     start_time = _parse_backtest_bound(payload.start_date, end=False)
