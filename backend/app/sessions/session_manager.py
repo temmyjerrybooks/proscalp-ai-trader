@@ -89,7 +89,7 @@ class SessionManager:
         active = start <= now <= end
         open_window = start <= now <= start + timedelta(minutes=90)
         strong_market = regime.lower() in {"strong", "hot"}
-        aggression = active and open_window and strong_market
+        aggression = active and open_window and strong_market and self.settings.aggression_mode_enabled
         notes = []
         if aggression:
             notes.append("session aggression mode active")

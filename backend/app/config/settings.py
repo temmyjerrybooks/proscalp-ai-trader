@@ -134,6 +134,10 @@ class Settings(BaseSettings):
     off_session_score_threshold_a: int = 80
     off_session_score_threshold_aplus: int = 90
     off_session_timing_score: float = 65.0
+    # Phase 2A — disable session-open aggression (London-open aggression was the
+    # worst real-trade cell: -$30.68, 9% win). When False, session_score uses the
+    # base value regardless of time-since-open.
+    aggression_mode_enabled: bool = False
     allow_unclear_regime_trading: bool = False
 
     # Phase 2A — strategy enablement (disabled setups are dropped from the live
