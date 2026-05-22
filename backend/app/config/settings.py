@@ -150,6 +150,9 @@ class Settings(BaseSettings):
 
     order_timeout_seconds: int = 20
     market_order_min_score: int = 88
+    # Phase 2A — when True, every order routes as an IOC limit regardless of
+    # score (market routing on high scores paid full slippage on losing A+ trades).
+    force_limit_orders: bool = True
     scalp_limit_time_in_force: Literal["GTC", "IOC", "FOK"] = "IOC"
     aggressive_limit_slippage_bps: float = 2.5
     max_signal_price_drift_bps: float = 12.0
