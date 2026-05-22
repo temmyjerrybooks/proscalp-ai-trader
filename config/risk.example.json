@@ -1,0 +1,12 @@
+{
+  "daily_profit_target_pct": 10,
+  "daily_hard_loss_limit_pct": -4,
+  "warning_loss_pct": -1.5,
+  "reduce_size_loss_pct": -2,
+  "aplus_only_loss_pct": -3,
+  "max_concurrent_trades": 5,
+  "max_total_exposure_pct": 35,
+  "max_coin_exposure_pct": 10,
+  "max_session_exposure_pct": 22,
+  "max_leverage": 5
+}

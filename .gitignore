@@ -1,0 +1,43 @@
+# Secrets / credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+id_rsa*
+ssh_keys/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.vite/
+
+# Databases & data
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Logs & backups
+logs/
+*.log
+backups/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

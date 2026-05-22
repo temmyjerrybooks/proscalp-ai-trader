@@ -1,0 +1,1459 @@
+from __future__ import annotations
+
+import asyncio
+import re
+from contextlib import suppress
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, time, timedelta, timezone
+
+import structlog
+from sqlalchemy import desc, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.alerts.telegram import TelegramAlertService
+from app.config.settings import Settings, TradingMode, get_settings
+from app.data.market_data import MarketDataBundle, MarketDataService
+from app.database.db import AsyncSessionLocal
+from app.database.models import (
+    CoinUniverse,
+    MarketRegime,
+    Order,
+    RiskEvent,
+    SetupScore,
+    Signal,
+    Trade,
+    utc_now,
+)
+from app.execution.order_manager import OrderManager
+from app.exchanges.base import Candle, ExchangeAdapter, OrderRequest, Position
+from app.exchanges.factory import create_exchange_adapter
+from app.indicators.technical import build_indicator_snapshot
+from app.paper_trading.simulator import PaperTradingSimulator
+from app.portfolio.exposure_manager import ExposureManager, ExposurePosition
+from app.regime.detector import MarketRegimeDetector, RegimeInput, RegimeResult
+from app.risk.risk_engine import RiskEngine, TradePermissionRequest
+from app.scoring.setup_score import SetupScoreInput, SetupScoreResult, SetupScoringEngine
+from app.services.accounting import (
+    account_balance_basis,
+    consecutive_loss_count,
+    daily_pnl_snapshot,
+    daily_trade_count,
+    trade_counts_for_loss_streak,
+)
+from app.sessions.session_manager import SessionManager, SessionState
+from app.strategies import default_strategies
+from app.strategies.base_strategy import Direction, StrategyContext, StrategySignal
+from app.universe.top50_scanner import CoinCandidate, Top50Scanner
+
+logger = structlog.get_logger(__name__)
+
+
+def _safe_error_message(error: object) -> str:
+    """Remove signed exchange query material before storing errors for the UI."""
+    text = str(error)
+    text = re.sub(r"([?&]signature=)[^&\s'\"]+", r"\1[redacted]", text)
+    text = re.sub(r"([?&]timestamp=)\d+", r"\1[redacted]", text)
+    text = re.sub(r"([?&]recvWindow=)\d+", r"\1[redacted]", text)
+    text = re.sub(r"([?&]newClientOrderId=)[^&\s'\"]+", r"\1[redacted]", text)
+    return text[:1000]
+
+
+@dataclass(slots=True)
+class BotRuntimeStatus:
+    enabled: bool = False
+    status: str = "stopped"
+    mode: str = "paper"
+    exchange: str = "binance"
+    started_at: datetime | None = None
+    stopped_at: datetime | None = None
+    emergency_stopped: bool = False
+    last_scan_count: int = 0
+    loop_task_active: bool = False
+    cycle_count: int = 0
+    last_cycle_at: datetime | None = None
+    last_signal_batch_at: datetime | None = None
+    last_cycle_message: str = "Idle"
+    last_signal_count: int = 0
+    last_rejection_count: int = 0
+    last_order_count: int = 0
+    cycle_symbol_limit: int = 0
+    strategy_count: int = 0
+    current_session: str = "closed"
+    current_regime: str = "unclear"
+    open_trade_count: int = 0
+    consecutive_losses: int = 0
+    recent_consecutive_losses: int = 0
+    loss_streak_scope_start: datetime | None = None
+    loss_cooldown_since: datetime | None = None
+    last_error: str | None = None
+    messages: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ScoredSignal:
+    signal: StrategySignal
+    score: SetupScoreResult
+    signal_id: str
+    candidate: CoinCandidate
+    context: StrategyContext
+
+
+class BotRunner:
+    """Supervised autonomous runtime for paper/testnet scalping.
+
+    The loop is deliberately live-locked. It can run continuously in paper or
+    testnet mode, but live modes still require explicit configuration and should
+    be reviewed before any production use.
+    """
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+        self.status = BotRuntimeStatus(mode=self.settings.trading_mode.value, exchange=self.settings.exchange.value)
+        self.alerts = TelegramAlertService(self.settings)
+        self.paper = PaperTradingSimulator(
+            starting_equity=self.settings.paper_starting_equity,
+            fee_bps=self.settings.fee_rate_bps,
+            slippage_bps=self.settings.slippage_bps,
+        )
+        self.risk_engine = RiskEngine(self.settings)
+        self.scoring = SetupScoringEngine(self.settings)
+        self.exposure = ExposureManager(self.settings)
+        self.strategies = default_strategies()
+        self.status.cycle_symbol_limit = self.settings.bot_cycle_symbol_limit
+        self.status.strategy_count = len(self.strategies)
+        self._task: asyncio.Task[None] | None = None
+        self._last_order_at: datetime | None = None
+        self._consecutive_losses = 0
+        self._recent_consecutive_losses = 0
+        self._loss_streak_scope_start: datetime | None = None
+        self._loss_cooldown_since: datetime | None = None
+        self._pending_signal_ids: list[str] = []
+        self._last_signal_ids: list[str] = []
+
+    def current_signal_ids(self) -> list[str]:
+        """Return the exact signal IDs from the last committed scan batch."""
+        return list(self._last_signal_ids)
+
+    async def start(self) -> BotRuntimeStatus:
+        if not self.settings.autonomous_trading_enabled:
+            self._remember("Autonomous trading loop is disabled by AUTONOMOUS_TRADING_ENABLED=false")
+            self.status.status = "blocked"
+            return self.status
+        if self.settings.is_live_mode and not self.settings.live_trading_enabled:
+            self._remember("Live trading requested but LIVE_TRADING_ENABLED=false")
+            self.status.status = "blocked"
+            return self.status
+        if self.settings.trading_mode == TradingMode.LIVE_FUTURES and not self.settings.futures_trading_confirmed:
+            self._remember("Live futures requested but FUTURES_TRADING_CONFIRMED=false")
+            self.status.status = "blocked"
+            return self.status
+        if self._task and not self._task.done():
+            self._remember("Bot loop already running")
+            return self.status
+
+        self.status.enabled = True
+        self.status.status = "running"
+        self.status.started_at = datetime.now(timezone.utc)
+        self.status.stopped_at = None
+        self.status.emergency_stopped = False
+        self.status.last_error = None
+        self._remember("Bot started; autonomous loop armed")
+        self._task = asyncio.create_task(self._run_loop(), name="proscalp-autonomous-loop")
+        logger.info("bot_started", mode=self.status.mode, exchange=self.status.exchange)
+        await self.alerts.send("bot_started", f"ProScalp AI Trader started in {self.status.mode} mode")
+        return self.status
+
+    async def stop(self) -> BotRuntimeStatus:
+        self.status.enabled = False
+        self.status.status = "stopped"
+        self.status.stopped_at = datetime.now(timezone.utc)
+        self._remember("Bot stopped")
+        await self._cancel_loop()
+        logger.info("bot_stopped")
+        await self.alerts.send("bot_stopped", "ProScalp AI Trader stopped")
+        return self.status
+
+    async def emergency_stop(self) -> BotRuntimeStatus:
+        self.status.enabled = False
+        self.status.status = "emergency_stopped"
+        self.status.emergency_stopped = True
+        self.status.stopped_at = datetime.now(timezone.utc)
+        self._remember("Emergency shutdown triggered")
+        await self._cancel_loop()
+        try:
+            adapter = create_exchange_adapter(self.settings)
+            if self.settings.trading_mode != TradingMode.PAPER:
+                for position in await adapter.fetch_positions():
+                    await adapter.close_position(position.symbol)
+            self.paper.close_all({}, reason="emergency_close")
+            async with AsyncSessionLocal() as db:
+                await self._mark_open_trades_closed(db, "emergency_stop")
+        except Exception as exc:  # pragma: no cover - defensive exchange branch
+            self.status.last_error = str(exc)
+            logger.error("emergency_close_failed", error=str(exc))
+        logger.warning("emergency_shutdown")
+        await self.alerts.send("emergency_shutdown", "Emergency shutdown triggered")
+        return self.status
+
+    async def close_all_positions(self, reason: str = "manual_close_all") -> dict[str, object]:
+        """Flatten open positions and update local trade records.
+
+        This is intentionally separate from emergency_stop: it closes risk, but
+        it does not disable the autonomous loop.
+        """
+        adapter = create_exchange_adapter(self.settings)
+        closed_orders: list[dict[str, object]] = []
+        canceled_orders: list[dict[str, object]] = []
+        errors: list[str] = []
+        failed_close_symbols: set[str] = set()
+        failed_cancel_symbols: set[str] = set()
+        async with AsyncSessionLocal() as db:
+            active_trades = await self._active_database_trades(db)
+            exchange_positions = await self._safe_fetch_positions(adapter)
+            open_orders = await self._safe_fetch_open_orders(adapter)
+            price_by_symbol = await self._best_effort_mark_prices(adapter, active_trades, exchange_positions)
+
+            if self.settings.trading_mode != TradingMode.PAPER:
+                for order in open_orders:
+                    try:
+                        canceled = await adapter.cancel_order(order.symbol, order.order_id)
+                        canceled_orders.append(
+                            {"symbol": order.symbol, "order_id": order.order_id, "status": canceled.status}
+                        )
+                    except Exception as exc:
+                        failed_cancel_symbols.add(order.symbol)
+                        errors.append(f"{order.symbol} cancel failed: {exc}")
+
+                symbols_to_close = {position.symbol for position in exchange_positions}
+                symbols_to_close.update(trade.symbol for trade in active_trades if trade.status == "open")
+                for symbol in sorted(symbols_to_close):
+                    try:
+                        result = await adapter.close_position(symbol)
+                        closed_orders.append(
+                            {
+                                "symbol": symbol,
+                                "order_id": result.order_id,
+                                "status": result.status,
+                                "quantity": result.quantity,
+                            }
+                        )
+                    except Exception as exc:
+                        failed_close_symbols.add(symbol)
+                        errors.append(f"{symbol} close failed: {exc}")
+            else:
+                self.paper.close_all(price_by_symbol, reason=reason)
+
+            for trade in active_trades:
+                if trade.status == "pending":
+                    if trade.symbol in failed_cancel_symbols:
+                        continue
+                    trade.status = "canceled"
+                    trade.closed_at = utc_now()
+                    trade.extra = {**(trade.extra or {}), "close_reason": f"{reason}_pending_cancel"}
+                    continue
+                if trade.symbol in failed_close_symbols:
+                    continue
+                price = price_by_symbol.get(trade.symbol, trade.entry_price)
+                await self._finalize_trade_close(db, trade, price, reason, send_alert=False)
+
+            db.add(
+                RiskEvent(
+                    severity="warning" if errors else "info",
+                    event_type="manual_close_all",
+                    message="Manual close-all completed" if not errors else "Manual close-all completed with errors",
+                    payload={
+                        "closed_orders": closed_orders,
+                        "canceled_orders": canceled_orders,
+                        "errors": errors,
+                        "trade_count": len(active_trades),
+                    },
+                )
+            )
+            await db.commit()
+
+        await self.alerts.send(
+            "trade_closed",
+            f"Manual close-all completed: {len(closed_orders)} exchange closes, {len(errors)} errors",
+        )
+        self._remember("Manual close-all executed")
+        return {
+            "accepted": True,
+            "message": "Close-all completed" if not errors else "Close-all completed with errors",
+            "closed_orders": closed_orders,
+            "canceled_orders": canceled_orders,
+            "errors": errors,
+        }
+
+    async def run_top50_scan(self, db: AsyncSession | None = None) -> list[CoinCandidate]:
+        adapter = create_exchange_adapter(self.settings)
+        scanner = Top50Scanner(adapter, self.settings)
+        candidates = await scanner.scan(db=db)
+        self.status.last_scan_count = len(candidates)
+        logger.info("top50_scan_completed", count=len(candidates))
+        await self.alerts.send("daily_top50_scan_completed", f"Top-50 scan completed: {len(candidates)} symbols")
+        return candidates
+
+    async def _run_loop(self) -> None:
+        self.status.loop_task_active = True
+        try:
+            while self.status.enabled:
+                await self.run_cycle()
+                await asyncio.sleep(max(5, self.settings.bot_loop_interval_seconds))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - last-resort guard
+            safe_error = _safe_error_message(exc)
+            self.status.status = "error"
+            self.status.last_error = safe_error
+            self._remember(f"Autonomous loop crashed: {safe_error}")
+            logger.exception("bot_loop_crashed", error=safe_error)
+            await self.alerts.send("exchange_api_error", f"Bot loop crashed: {safe_error}")
+        finally:
+            self.status.loop_task_active = False
+
+    async def run_cycle(self) -> dict[str, object]:
+        adapter = create_exchange_adapter(self.settings)
+        async with AsyncSessionLocal() as db:
+            await self._manage_open_trades(db, adapter)
+            candidates = await self._load_watchlist(db)
+            if not candidates:
+                candidates = await self.run_top50_scan(db)
+
+            regime = await self._detect_regime(adapter, candidates)
+            await self._persist_regime(db, regime)
+            session = SessionManager(self.settings).trading_session(regime=regime.regime)
+            self._update_cycle_status(session, regime)
+
+            if not self.status.enabled:
+                return {"status": "stopped"}
+            if not self._regime_allows_new_trades(regime):
+                return await self._cycle_wait(db, f"Market regime is {regime.regime}; trading paused")
+            if not session.tradable:
+                return await self._cycle_wait(db, "No tradable session is active")
+
+            open_trades = await self._active_database_trades(db)
+            exchange_positions = await self._safe_fetch_positions(adapter)
+            open_orders = await self._safe_fetch_open_orders(adapter)
+            await self._reconcile_pending_and_orphan_positions(db, exchange_positions, open_orders)
+            open_trades = await self._active_database_trades(db)
+            active_symbols = {trade.symbol for trade in open_trades}
+            exchange_only_symbols = {position.symbol for position in exchange_positions if position.symbol not in active_symbols}
+            active_symbol_count = len(active_symbols | exchange_only_symbols)
+            account_equity = await self._account_equity(adapter)
+            daily_snapshot = await daily_pnl_snapshot(
+                db,
+                self.settings,
+                None if self.settings.trading_mode == TradingMode.PAPER else adapter,
+                account_balance=account_equity,
+                exchange_positions=exchange_positions,
+            )
+            self._loss_streak_scope_start = self._loss_streak_since(session, daily_snapshot.day_start)
+            cooldown_cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, self.settings.loss_cooldown_minutes))
+            self._loss_cooldown_since = max(self._loss_streak_scope_start, cooldown_cutoff)
+            self._consecutive_losses = await consecutive_loss_count(
+                db,
+                since=self._loss_streak_scope_start,
+                min_abs_pnl=self.settings.loss_streak_min_abs_pnl,
+            )
+            self._recent_consecutive_losses = await consecutive_loss_count(
+                db,
+                since=self._loss_cooldown_since,
+                min_abs_pnl=self.settings.loss_streak_min_abs_pnl,
+            )
+            self._update_loss_status()
+            today_trade_count = await daily_trade_count(db, daily_snapshot.day_start)
+            scan_only_reasons = self._scan_only_reasons(
+                active_symbol_count=active_symbol_count,
+                open_order_count=len(open_orders),
+                today_trade_count=today_trade_count,
+                daily_pnl_pct=daily_snapshot.daily_pnl_pct,
+            )
+            account_equity = daily_snapshot.account_equity
+            btc_direction, eth_direction = await self._leader_directions(adapter)
+            scored_signals = await self._scan_for_signals(
+                db=db,
+                adapter=adapter,
+                candidates=candidates,
+                session=session,
+                regime=regime,
+                btc_direction=btc_direction,
+                eth_direction=eth_direction,
+            )
+            if not scored_signals:
+                result = await self._cycle_wait(db, "No setup passed strategy scoring")
+                self._publish_pending_signal_batch()
+                return result
+            if scan_only_reasons:
+                message = f"Scan-only cycle: {'; '.join(scan_only_reasons)}"
+                await self._risk_event(
+                    db,
+                    "info",
+                    "scan_only",
+                    message,
+                    {
+                        "signals": len(scored_signals),
+                        "active_symbols": active_symbol_count,
+                        "open_orders": len(open_orders),
+                        "today_trade_count": today_trade_count,
+                        "daily_pnl_pct": daily_snapshot.daily_pnl_pct,
+                    },
+                )
+                result = await self._cycle_wait(db, message)
+                self._publish_pending_signal_batch()
+                return {**result, "signals": len(scored_signals), "orders": 0}
+
+            orders_sent = 0
+            for scored in scored_signals:
+                if orders_sent >= self.settings.bot_max_orders_per_cycle:
+                    break
+                if self._order_cooldown_active():
+                    break
+                result = await self._try_execute_scored_signal(
+                    db=db,
+                    adapter=adapter,
+                    scored=scored,
+                    account_equity=account_equity,
+                    daily_pnl_pct=daily_snapshot.daily_pnl_pct,
+                    session=session,
+                    regime=regime,
+                    open_trades=open_trades,
+                    exchange_positions=exchange_positions,
+                )
+                if result:
+                    orders_sent += 1
+                    self._last_order_at = datetime.now(timezone.utc)
+
+            await db.commit()
+            self._publish_pending_signal_batch()
+            self.status.last_order_count = orders_sent
+            message = f"Cycle complete: {len(scored_signals)} tradable signals, {orders_sent} orders"
+            self.status.last_cycle_message = message
+            self._remember(message)
+            return {"status": "complete", "signals": len(scored_signals), "orders": orders_sent}
+
+    async def _scan_for_signals(
+        self,
+        db: AsyncSession,
+        adapter: ExchangeAdapter,
+        candidates: list[CoinCandidate],
+        session: SessionState,
+        regime: RegimeResult,
+        btc_direction: Direction | None,
+        eth_direction: Direction | None,
+    ) -> list[ScoredSignal]:
+        market_data = MarketDataService(adapter)
+        scored: list[ScoredSignal] = []
+        signal_ids: list[str] = []
+        signal_count = 0
+        rejection_count = 0
+        self.status.last_signal_batch_at = datetime.now(timezone.utc)
+        active_candidates = [candidate for candidate in candidates if candidate.approved]
+        for candidate in active_candidates[: self.settings.bot_cycle_symbol_limit]:
+            try:
+                bundle = await market_data.fetch_bundle(
+                    candidate.symbol,
+                    timeframes=["15m", "5m", "3m", "1m"],
+                    candle_limit=120,
+                )
+            except Exception as exc:
+                await self._risk_event(db, "warning", "market_data_error", str(exc), {"symbol": candidate.symbol})
+                continue
+            context = self._build_strategy_context(
+                candidate=candidate,
+                bundle=bundle,
+                session=session,
+                regime=regime,
+                btc_direction=btc_direction,
+                eth_direction=eth_direction,
+            )
+            best_for_symbol: ScoredSignal | None = None
+            for strategy in self.strategies:
+                signal = strategy.evaluate(context)
+                signal_count += 1
+                signal_id = await self._persist_signal(db, signal)
+                signal_ids.append(signal_id)
+                if not signal.accepted:
+                    rejection_count += 1
+                    continue
+                score = self._score_signal(signal, context, candidate, regime, session, bundle)
+                await self._persist_score(db, signal_id, signal, score)
+                minimum_score = self._minimum_score_for_session(session)
+                if score.total < minimum_score:
+                    rejection_count += 1
+                    reason = (
+                        f"setup score {score.total} below off-session threshold {minimum_score}"
+                        if session.name == "off_session"
+                        else f"setup score {score.total} below session threshold {minimum_score}"
+                    )
+                    await self._risk_event(
+                        db,
+                        "info",
+                        "setup_rejected",
+                        "; ".join([reason, *score.rejection_reasons]),
+                        {
+                            "signal_id": signal_id,
+                            "symbol": signal.symbol,
+                            "setup": signal.setup_name,
+                            "score": score.total,
+                        },
+                    )
+                    continue
+                item = ScoredSignal(signal, score, signal_id, candidate, context)
+                if best_for_symbol is None or score.total > best_for_symbol.score.total:
+                    best_for_symbol = item
+            if best_for_symbol:
+                scored.append(best_for_symbol)
+
+        scored.sort(key=lambda item: item.score.total, reverse=True)
+        self.status.last_signal_count = signal_count
+        self.status.last_rejection_count = rejection_count
+        self._pending_signal_ids = signal_ids
+        return scored
+
+    def _publish_pending_signal_batch(self) -> None:
+        self._last_signal_ids = list(self._pending_signal_ids)
+        self._pending_signal_ids = []
+
+    async def _try_execute_scored_signal(
+        self,
+        db: AsyncSession,
+        adapter: ExchangeAdapter,
+        scored: ScoredSignal,
+        account_equity: float,
+        daily_pnl_pct: float,
+        session: SessionState,
+        regime: RegimeResult,
+        open_trades: list[Trade],
+        exchange_positions: list[Position],
+    ) -> bool:
+        signal = scored.signal
+        if signal.symbol in {trade.symbol for trade in open_trades}:
+            await self._risk_event(
+                db,
+                "info",
+                "trade_rejected",
+                "active database trade already exists",
+                {**asdict(signal), "signal_id": scored.signal_id},
+            )
+            return False
+        if signal.symbol in {position.symbol for position in exchange_positions}:
+            await self._risk_event(
+                db,
+                "info",
+                "trade_rejected",
+                "active exchange position already exists",
+                {**asdict(signal), "signal_id": scored.signal_id},
+            )
+            return False
+
+        daily_state = self.risk_engine.evaluate_daily_state(
+            daily_pnl_pct,
+            self._consecutive_losses,
+            recent_consecutive_losses=self._recent_consecutive_losses,
+        )
+        setup_assessment = self.risk_engine.assess_setup_score(scored.score.total, session.name, daily_state)
+        risk_pct = setup_assessment.risk_pct
+        position_size = self.risk_engine.calculate_position_size(
+            account_equity=account_equity,
+            risk_pct=risk_pct,
+            entry_price=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            leverage=self.settings.default_leverage,
+        )
+        side = "buy" if signal.direction == "long" else "sell"
+        try:
+            slippage_bps = await adapter.estimate_slippage(signal.symbol, side, position_size.quantity)
+        except Exception:
+            slippage_bps = self.settings.slippage_bps
+        expected_net_profit_pct = self._expected_net_profit_pct(signal, scored.context.spread_bps, slippage_bps)
+        order_size_valid = await adapter.validate_min_order_size(
+            signal.symbol,
+            position_size.quantity,
+            signal.entry_price,
+        )
+        btc_eth_confirmed = self._leader_confirmation_valid(scored.context, signal.direction, scored.score)
+        open_exposure = self._exposure_positions(open_trades, exchange_positions, session.name)
+        exposure_decision = self.exposure.can_open(
+            account_equity=account_equity,
+            candidate_symbol=signal.symbol,
+            candidate_side=signal.direction,
+            candidate_notional=position_size.notional,
+            candidate_open_risk=self._position_open_risk(
+                entry_price=signal.entry_price,
+                stop_loss=signal.stop_loss,
+                quantity=position_size.quantity,
+            ),
+            session=session.name,
+            market_regime=regime.regime,
+            open_positions=open_exposure,
+            btc_eth_confirmation=btc_eth_confirmed,
+        )
+        if not exposure_decision.allowed:
+            await self._risk_event(
+                db,
+                "info",
+                "trade_rejected",
+                "; ".join(exposure_decision.reasons),
+                {
+                    "signal_id": scored.signal_id,
+                    "symbol": signal.symbol,
+                    "setup": signal.setup_name,
+                    "exposure": exposure_decision.diagnostics,
+                },
+            )
+            return False
+
+        permission = TradePermissionRequest(
+            bot_enabled=self.status.enabled,
+            exchange_connected=True,
+            live_requested=self.settings.is_live_mode,
+            daily_pnl_pct=daily_pnl_pct,
+            consecutive_losses=self._consecutive_losses,
+            recent_consecutive_losses=self._recent_consecutive_losses,
+            open_trades=self._active_symbol_count(open_trades, exchange_positions),
+            market_regime=regime.regime,
+            session_tradable=session.tradable,
+            coin_in_watchlist=scored.candidate.approved,
+            liquid_enough=scored.candidate.liquidity_score >= 40,
+            spread_bps=scored.context.spread_bps,
+            expected_net_profit_pct=expected_net_profit_pct,
+            setup_score=scored.score.total,
+            setup_grade=setup_assessment.grade,
+            btc_eth_confirmed=btc_eth_confirmed,
+            risk_reward=signal.risk_reward_ratio,
+            position_size_valid=position_size.valid,
+            order_size_valid=order_size_valid,
+            setup_score_threshold=self._minimum_score_for_session(session),
+        )
+        if self.settings.trading_mode != TradingMode.PAPER and self.settings.is_futures_mode:
+            try:
+                await adapter.set_leverage(signal.symbol, position_size.leverage)
+            except Exception as exc:
+                await self._risk_event(
+                    db,
+                    "error",
+                    "exchange_api_error",
+                    f"failed to set leverage before order: {_safe_error_message(exc)}",
+                    {
+                        "signal_id": scored.signal_id,
+                        "symbol": signal.symbol,
+                        "setup": signal.setup_name,
+                        "leverage": position_size.leverage,
+                    },
+                )
+                return False
+
+        manager = OrderManager(adapter, risk_engine=self.risk_engine, paper=self.paper, settings=self.settings)
+        report = await manager.execute_signal(signal, permission, position_size.quantity)
+        await self._persist_execution(
+            db,
+            scored,
+            report=report,
+            quantity=position_size.quantity,
+            setup_assessment=setup_assessment,
+            position_size=position_size,
+            session=session,
+            regime=regime,
+        )
+        if not report.accepted:
+            await self._risk_event(
+                db,
+                "info",
+                "trade_rejected",
+                "; ".join(report.reasons or report.risk_decision.reasons),
+                {
+                    "signal_id": scored.signal_id,
+                    "symbol": signal.symbol,
+                    "setup": signal.setup_name,
+                    "score": scored.score.total,
+                    "grade": setup_assessment.grade,
+                    "risk_pct": setup_assessment.risk_pct,
+                },
+            )
+            return False
+
+        await self.alerts.send(
+            "trade_opened",
+            f"{self.settings.trading_mode.value.upper()} {signal.direction.upper()} {signal.symbol} "
+            f"{signal.setup_name} score {scored.score.total} grade {setup_assessment.grade} "
+            f"risk {setup_assessment.risk_pct:.2f}%",
+        )
+        return True
+
+    async def _persist_execution(
+        self,
+        db: AsyncSession,
+        scored: ScoredSignal,
+        report,
+        quantity: float,
+        setup_assessment,
+        position_size,
+        session: SessionState,
+        regime: RegimeResult,
+    ) -> None:
+        signal = scored.signal
+        trade: Trade | None = None
+        if report.accepted and (report.paper_position or report.order_result):
+            order_status = report.order_result.status if report.order_result else "filled"
+            trade_status = "open"
+            if report.order_result and report.order_result.order_type == "limit" and report.order_result.filled_quantity <= 0:
+                trade_status = "pending"
+            trade_data = dict(
+                symbol=signal.symbol,
+                side=signal.direction,
+                exchange=self.settings.exchange.value,
+                mode=self.settings.trading_mode.value,
+                setup_name=signal.setup_name,
+                entry_price=signal.entry_price,
+                stop_loss=signal.stop_loss,
+                take_profit={"levels": signal.take_profit_levels},
+                quantity=quantity,
+                status=trade_status,
+                extra={
+                    "signal_id": scored.signal_id,
+                    "setup_score": scored.score.total,
+                    "grade": setup_assessment.grade,
+                    "normal_grade": scored.score.grade,
+                    "risk_pct": setup_assessment.risk_pct,
+                    "base_risk_pct": setup_assessment.base_risk_pct,
+                    "risk_amount": position_size.risk_amount,
+                    "risk_range": list(setup_assessment.risk_range),
+                    "score_floor": setup_assessment.score_floor,
+                    "score_ceiling": setup_assessment.score_ceiling,
+                    "score_permission": setup_assessment.permission,
+                    "score_session": setup_assessment.session_name,
+                    "entry_session": session.name,
+                    "entry_regime": regime.regime,
+                    "exchange_order_id": report.order_result.order_id if report.order_result else None,
+                    "order_status": order_status,
+                    "original_quantity": quantity,
+                    "remaining_quantity": quantity,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "break_even_moved": False,
+                },
+            )
+            if report.paper_position:
+                trade_data["id"] = report.paper_position.id
+            trade = Trade(**trade_data)
+            db.add(trade)
+            await db.flush()
+
+        if report.order_result:
+            db.add(
+                Order(
+                    trade_id=trade.id if trade else None,
+                    exchange_order_id=report.order_result.order_id,
+                    symbol=signal.symbol,
+                    side=report.order_result.side,
+                    order_type=report.order_result.order_type,
+                    price=signal.entry_price if report.order_result.order_type == "limit" else None,
+                    quantity=report.order_result.quantity,
+                    filled_quantity=report.order_result.filled_quantity,
+                    status=report.order_result.status,
+                    raw_response=report.order_result.raw,
+                )
+            )
+
+    async def _manage_open_trades(self, db: AsyncSession, adapter: ExchangeAdapter) -> None:
+        trades = await self._open_database_trades(db)
+        self.status.open_trade_count = len(trades)
+        for trade in trades:
+            try:
+                book = await adapter.fetch_order_book(trade.symbol, limit=20)
+                price = book.mid_price
+            except Exception:
+                continue
+            if price <= 0:
+                continue
+            trade.unrealized_pnl = self._unrealized_pnl(trade, price)
+            await self._maybe_move_break_even(trade, price)
+            close_reason = self._close_reason(trade, price)
+            if close_reason:
+                await self._close_trade(db, adapter, trade, price, close_reason)
+                continue
+            await self._maybe_partial_exit(db, adapter, trade, price)
+
+    async def _reconcile_pending_and_orphan_positions(self, db: AsyncSession, positions, open_orders) -> None:
+        if self.settings.trading_mode == TradingMode.PAPER:
+            return
+        pending_result = await db.execute(select(Trade).where(Trade.status == "pending"))
+        pending_trades = list(pending_result.scalars().all())
+        open_symbols = {trade.symbol for trade in await self._open_database_trades(db)}
+        pending_symbols = {trade.symbol for trade in pending_trades}
+        order_symbols = {order.symbol for order in open_orders}
+
+        for trade in pending_trades:
+            position = next((item for item in positions if item.symbol == trade.symbol), None)
+            if position:
+                trade.status = "open"
+                trade.entry_price = position.entry_price or trade.entry_price
+                trade.quantity = position.quantity
+                trade.extra = {
+                    **(trade.extra or {}),
+                    "reconciled_from_exchange": True,
+                    "remaining_quantity": position.quantity,
+                }
+                open_symbols.add(trade.symbol)
+            elif trade.symbol not in order_symbols:
+                trade.status = "canceled"
+                trade.closed_at = utc_now()
+                trade.extra = {**(trade.extra or {}), "close_reason": "order_not_open_on_exchange"}
+
+        for position in positions:
+            if position.symbol in open_symbols or position.symbol in pending_symbols:
+                continue
+            stop_pct = 0.0035
+            target_pct = [0.003, 0.005, 0.008]
+            if position.side == "long":
+                stop_loss = position.entry_price * (1 - stop_pct)
+                take_profit = [position.entry_price * (1 + pct) for pct in target_pct]
+            else:
+                stop_loss = position.entry_price * (1 + stop_pct)
+                take_profit = [position.entry_price * (1 - pct) for pct in target_pct]
+            db.add(
+                Trade(
+                    symbol=position.symbol,
+                    side=position.side,
+                    exchange=self.settings.exchange.value,
+                    mode=self.settings.trading_mode.value,
+                    setup_name="Exchange reconciled position",
+                    entry_price=position.entry_price,
+                    stop_loss=round(stop_loss, 8),
+                    take_profit={"levels": [round(price, 8) for price in take_profit]},
+                    quantity=position.quantity,
+                    status="open",
+                    unrealized_pnl=position.unrealized_pnl,
+                    extra={
+                        "reconciled_orphan_position": True,
+                        "entry_session": "unknown",
+                        "entry_regime": "unknown",
+                        "original_quantity": position.quantity,
+                        "remaining_quantity": position.quantity,
+                        "tp1_hit": False,
+                        "tp2_hit": False,
+                        "break_even_moved": False,
+                    },
+                )
+            )
+            await self._risk_event(
+                db,
+                "warning",
+                "exchange_position_reconciled",
+                "Exchange position had no local trade record; attached protective management",
+                {"symbol": position.symbol, "side": position.side, "quantity": position.quantity},
+            )
+
+    async def _maybe_partial_exit(self, db: AsyncSession, adapter: ExchangeAdapter, trade: Trade, price: float) -> None:
+        levels = self._take_profit_levels(trade)
+        if len(levels) < 2:
+            return
+        extra = dict(trade.extra or {})
+        original_quantity = float(extra.get("original_quantity") or trade.quantity)
+        if not extra.get("tp1_hit") and self._target_hit(trade.side, price, levels[0]):
+            quantity = min(trade.quantity, original_quantity * 0.4)
+            await self._reduce_trade(db, adapter, trade, price, quantity, "tp1")
+            extra["tp1_hit"] = True
+        if not extra.get("tp2_hit") and self._target_hit(trade.side, price, levels[1]):
+            quantity = min(trade.quantity, original_quantity * 0.3)
+            await self._reduce_trade(db, adapter, trade, price, quantity, "tp2")
+            extra["tp2_hit"] = True
+        extra["remaining_quantity"] = trade.quantity
+        trade.extra = extra
+
+    async def _reduce_trade(
+        self,
+        db: AsyncSession,
+        adapter: ExchangeAdapter,
+        trade: Trade,
+        price: float,
+        quantity: float,
+        reason: str,
+    ) -> None:
+        if quantity <= 0:
+            return
+        await self._send_reduce_only(adapter, trade, quantity)
+        pnl = self._exit_pnl(trade, price, quantity)
+        trade.quantity = max(0.0, trade.quantity - quantity)
+        trade.realized_pnl += pnl
+        db.add(
+            RiskEvent(
+                severity="info",
+                event_type="partial_exit",
+                message=f"{trade.symbol} {reason} partial exit",
+                payload={"trade_id": trade.id, "quantity": quantity, "pnl": pnl},
+            )
+        )
+        await self.alerts.send(
+            "trade_partially_closed",
+            f"{trade.symbol} partial close at {reason} {self._trade_assessment_label(trade)}",
+        )
+
+    async def _close_trade(
+        self,
+        db: AsyncSession,
+        adapter: ExchangeAdapter,
+        trade: Trade,
+        price: float,
+        reason: str,
+    ) -> None:
+        await self._send_reduce_only(adapter, trade, trade.quantity)
+        await self._finalize_trade_close(db, trade, price, reason)
+
+    async def _finalize_trade_close(
+        self,
+        db: AsyncSession,
+        trade: Trade,
+        price: float,
+        reason: str,
+        *,
+        send_alert: bool = True,
+    ) -> None:
+        trade.realized_pnl += self._exit_pnl(trade, price, trade.quantity)
+        trade.unrealized_pnl = 0.0
+        trade.status = "closed"
+        trade.closed_at = utc_now()
+        trade.extra = {**(trade.extra or {}), "close_reason": reason}
+        self._record_closed_trade_outcome(trade)
+        if not send_alert:
+            return
+        alert_type = "stop_loss_hit" if reason == "stop_loss" else "take_profit_hit"
+        label = self._trade_assessment_label(trade)
+        await self.alerts.send(alert_type, f"{trade.symbol} closed by {reason} {label}")
+        await self.alerts.send("trade_closed", f"{trade.symbol} trade closed: {reason} {label}")
+
+    def _record_closed_trade_outcome(self, trade: Trade) -> None:
+        if not trade_counts_for_loss_streak(trade):
+            return
+        pnl = float(trade.realized_pnl or 0.0)
+        if abs(pnl) < self.settings.loss_streak_min_abs_pnl:
+            return
+        if pnl < 0:
+            self._consecutive_losses += 1
+            self._recent_consecutive_losses += 1
+        elif pnl > 0:
+            self._consecutive_losses = 0
+            self._recent_consecutive_losses = 0
+        self._update_loss_status()
+
+    async def _send_reduce_only(self, adapter: ExchangeAdapter, trade: Trade, quantity: float) -> None:
+        if self.settings.trading_mode == TradingMode.PAPER:
+            return
+        side = "sell" if trade.side == "long" else "buy"
+        with suppress(Exception):
+            await adapter.place_order(
+                OrderRequest(
+                    symbol=trade.symbol,
+                    side=side,  # type: ignore[arg-type]
+                    order_type="market",
+                    quantity=quantity,
+                    reduce_only=True,
+                )
+            )
+
+    async def _cycle_wait(self, db: AsyncSession, message: str) -> dict[str, object]:
+        await db.commit()
+        self.status.last_order_count = 0
+        self.status.last_cycle_message = message
+        self._remember(message)
+        return {"status": "waiting", "message": message}
+
+    async def _load_watchlist(self, db: AsyncSession) -> list[CoinCandidate]:
+        latest_result = await db.execute(select(func.max(CoinUniverse.scan_date)))
+        latest = latest_result.scalar_one_or_none()
+        if not latest:
+            return []
+        result = await db.execute(
+            select(CoinUniverse)
+            .where(CoinUniverse.scan_date == latest)
+            .order_by(CoinUniverse.rank)
+            .limit(self.settings.top_coin_limit)
+        )
+        rows = result.scalars().all()
+        self.status.last_scan_count = len(rows)
+        return [
+            CoinCandidate(
+                symbol=row.symbol,
+                rank=row.rank,
+                score=row.score,
+                quote_volume=row.quote_volume,
+                spread_bps=row.spread_bps,
+                volatility_pct=row.volatility_pct,
+                liquidity_score=row.liquidity_score,
+                market_cap_rank=None,
+                approved=row.approved,
+                reasons=row.reasons,
+            )
+            for row in rows
+        ]
+
+    async def _detect_regime(self, adapter: ExchangeAdapter, candidates: list[CoinCandidate]) -> RegimeResult:
+        try:
+            btc_candles, eth_candles = await asyncio.gather(
+                adapter.fetch_ohlcv("BTCUSDT", "15m", limit=120),
+                adapter.fetch_ohlcv("ETHUSDT", "15m", limit=120),
+            )
+            btc = build_indicator_snapshot(btc_candles)
+            eth = build_indicator_snapshot(eth_candles)
+            average_spread = (
+                sum(candidate.spread_bps for candidate in candidates[:10]) / max(1, len(candidates[:10]))
+            )
+            moving_ratio = (
+                sum(1 for candidate in candidates[:20] if candidate.volatility_pct >= self.settings.min_volatility_pct)
+                / max(1, len(candidates[:20]))
+            )
+            data = RegimeInput(
+                btc=btc,
+                eth=eth,
+                average_spread_bps=average_spread,
+                moving_coin_ratio=moving_ratio,
+                abnormal_wick_ratio=self._abnormal_wick_ratio(btc_candles[-30:] + eth_candles[-30:]),
+                correlation_risk=0.35,
+            )
+            return MarketRegimeDetector().classify(data)
+        except Exception as exc:
+            logger.warning("regime_detection_failed", error=str(exc))
+            return RegimeResult("unclear", 45, True, 8, [f"regime detector fallback: {exc}"])
+
+    async def _persist_regime(self, db: AsyncSession, regime: RegimeResult) -> None:
+        db.add(
+            MarketRegime(
+                regime=regime.regime,
+                tradable=regime.tradable,
+                score=regime.score,
+                reasons=regime.reasons,
+                inputs={"source": "autonomous_loop"},
+            )
+        )
+
+    def _build_strategy_context(
+        self,
+        candidate: CoinCandidate,
+        bundle: MarketDataBundle,
+        session: SessionState,
+        regime: RegimeResult,
+        btc_direction: Direction | None,
+        eth_direction: Direction | None,
+    ) -> StrategyContext:
+        five_minute = bundle.candles_by_timeframe.get("5m", [])
+        fifteen_minute = bundle.candles_by_timeframe.get("15m", [])
+        asian_high, asian_low = self._session_range(fifteen_minute, time(0, 0), time(4, 0))
+        intraday_high = max((candle.high for candle in five_minute[-30:]), default=None)
+        intraday_low = min((candle.low for candle in five_minute[-30:]), default=None)
+        book = bundle.order_book
+        return StrategyContext(
+            symbol=candidate.symbol,
+            candles_by_timeframe=bundle.candles_by_timeframe,
+            session_name=session.name,
+            regime=regime.regime,
+            coin_strength_score=candidate.score,
+            btc_direction=btc_direction,
+            eth_direction=eth_direction,
+            asian_high=asian_high,
+            asian_low=asian_low,
+            intraday_high=intraday_high,
+            intraday_low=intraday_low,
+            spread_bps=book.spread_bps if book else candidate.spread_bps,
+            order_book_imbalance=book.imbalance() if book else 0.0,
+            allow_short=self.settings.market_type == "futures",
+        )
+
+    def _score_signal(
+        self,
+        signal: StrategySignal,
+        context: StrategyContext,
+        candidate: CoinCandidate,
+        regime: RegimeResult,
+        session: SessionState,
+        bundle: MarketDataBundle,
+    ) -> SetupScoreResult:
+        snapshot = bundle.indicators_by_timeframe.get("5m") or bundle.indicators_by_timeframe.get("3m")
+        volume_score = min(100.0, (snapshot.relative_volume * 65) if snapshot else signal.confidence_score)
+        trend_score = max(snapshot.trend_strength_score if snapshot else 0.0, signal.confidence_score)
+        rr_score = min(100.0, signal.risk_reward_ratio / max(self.settings.min_risk_reward, 0.1) * 70)
+        leader_state = self._leader_state(context, signal.direction)
+        leader_score = {"aligned": 100.0, "neutral": 70.0, "conflict": 15.0}[leader_state]
+        spread_score = max(0.0, 100.0 - context.spread_bps * 8)
+        session_score = (
+            100.0
+            if session.aggression_mode
+            else self.settings.off_session_timing_score
+            if session.name == "off_session"
+            else 82.0
+            if session.tradable
+            else 0.0
+        )
+        return self.scoring.score(
+            SetupScoreInput(
+                market_regime_score=regime.score,
+                session_timing_score=session_score,
+                coin_strength_score=candidate.score,
+                volume_confirmation_score=volume_score,
+                trend_alignment_score=trend_score,
+                liquidity_orderbook_score=candidate.liquidity_score,
+                risk_reward_score=rr_score,
+                btc_eth_confirmation_score=leader_score,
+                spread_slippage_score=spread_score,
+            )
+        )
+
+    def _minimum_score_for_session(self, session: SessionState) -> int:
+        return self.risk_engine.minimum_score_for_session(session.name)
+
+    async def _persist_signal(self, db: AsyncSession, signal: StrategySignal) -> str:
+        row = Signal(
+            symbol=signal.symbol,
+            setup_name=signal.setup_name,
+            direction=signal.direction,
+            entry_price=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            take_profit={"levels": signal.take_profit_levels},
+            confidence_score=signal.confidence_score,
+            accepted=signal.accepted,
+            reasons_for_entry=signal.reasons_for_entry,
+            rejection_reasons=signal.rejection_reasons,
+        )
+        db.add(row)
+        await db.flush()
+        return row.id
+
+    async def _persist_score(
+        self,
+        db: AsyncSession,
+        signal_id: str,
+        signal: StrategySignal,
+        score: SetupScoreResult,
+    ) -> None:
+        db.add(
+            SetupScore(
+                signal_id=signal_id,
+                symbol=signal.symbol,
+                total_score=score.total,
+                grade=score.grade,
+                breakdown=score.breakdown,
+            )
+        )
+
+    async def _risk_event(
+        self,
+        db: AsyncSession,
+        severity: str,
+        event_type: str,
+        message: str,
+        payload: dict,
+    ) -> None:
+        db.add(RiskEvent(severity=severity, event_type=event_type, message=_safe_error_message(message), payload=payload))
+
+    async def _open_database_trades(self, db: AsyncSession) -> list[Trade]:
+        result = await db.execute(select(Trade).where(Trade.status == "open").order_by(desc(Trade.opened_at)))
+        return list(result.scalars().all())
+
+    async def _active_database_trades(self, db: AsyncSession) -> list[Trade]:
+        result = await db.execute(
+            select(Trade).where(Trade.status.in_(["open", "pending"])).order_by(desc(Trade.opened_at))
+        )
+        return list(result.scalars().all())
+
+    async def _mark_open_trades_closed(self, db: AsyncSession, reason: str) -> None:
+        for trade in await self._open_database_trades(db):
+            trade.status = "closed"
+            trade.closed_at = utc_now()
+            trade.extra = {**(trade.extra or {}), "close_reason": reason}
+        await db.commit()
+
+    async def _safe_fetch_positions(self, adapter: ExchangeAdapter) -> list[Position]:
+        if self.settings.trading_mode == TradingMode.PAPER:
+            return []
+        try:
+            return await adapter.fetch_positions()
+        except Exception as exc:
+            logger.warning("fetch_positions_failed", error=str(exc))
+            return []
+
+    async def _safe_fetch_open_orders(self, adapter: ExchangeAdapter):
+        if self.settings.trading_mode == TradingMode.PAPER:
+            return []
+        try:
+            return await adapter.fetch_open_orders()
+        except Exception as exc:
+            logger.warning("fetch_open_orders_failed", error=str(exc))
+            return []
+
+    async def _best_effort_mark_prices(
+        self,
+        adapter: ExchangeAdapter,
+        trades: list[Trade],
+        exchange_positions: list[Position],
+    ) -> dict[str, float]:
+        prices = {
+            position.symbol: position.mark_price or position.entry_price
+            for position in exchange_positions
+            if (position.mark_price or position.entry_price) > 0
+        }
+        for trade in trades:
+            if trade.symbol in prices:
+                continue
+            try:
+                book = await adapter.fetch_order_book(trade.symbol, limit=20)
+                if book.mid_price > 0:
+                    prices[trade.symbol] = book.mid_price
+                    continue
+            except Exception:
+                pass
+            prices[trade.symbol] = trade.entry_price
+        return prices
+
+    async def _account_equity(self, adapter: ExchangeAdapter) -> float:
+        if self.settings.trading_mode == TradingMode.PAPER:
+            return self.paper.equity
+        try:
+            account_balance, _ = await account_balance_basis(self.settings, adapter)
+            return account_balance
+        except Exception as exc:
+            logger.warning("account_equity_fallback", error=str(exc))
+        return self.settings.paper_starting_equity
+
+    async def _leader_directions(self, adapter: ExchangeAdapter) -> tuple[Direction | None, Direction | None]:
+        service = MarketDataService(adapter)
+        btc, eth = await asyncio.gather(
+            service.leader_direction("BTCUSDT"),
+            service.leader_direction("ETHUSDT"),
+            return_exceptions=True,
+        )
+        return (
+            btc if btc in {"long", "short"} else None,
+            eth if eth in {"long", "short"} else None,
+        )
+
+    def _exposure_positions(
+        self,
+        open_trades: list[Trade],
+        exchange_positions: list[Position],
+        session_name: str,
+    ) -> list[ExposurePosition]:
+        trades_by_symbol = {trade.symbol: trade for trade in open_trades}
+        exposures_by_symbol = {}
+        for trade in open_trades:
+            exposures_by_symbol[trade.symbol] = ExposurePosition(
+                symbol=trade.symbol,
+                side=trade.side,
+                notional=trade.quantity * trade.entry_price,
+                session=self._trade_entry_session(trade),
+                open_risk=self._trade_open_risk(trade),
+                source="database",
+            )
+
+        for position in exchange_positions:
+            trade = trades_by_symbol.get(position.symbol)
+            if trade:
+                exposures_by_symbol[position.symbol] = ExposurePosition(
+                    symbol=position.symbol,
+                    side=position.side,
+                    notional=position.quantity * position.mark_price,
+                    session=self._trade_entry_session(trade),
+                    open_risk=self._position_open_risk(trade.entry_price, trade.stop_loss, position.quantity),
+                    source="database+exchange",
+                )
+                continue
+            exposures_by_symbol[position.symbol] = ExposurePosition(
+                symbol=position.symbol,
+                side=position.side,
+                notional=position.quantity * position.mark_price,
+                session=session_name,
+                open_risk=self._exchange_only_open_risk(position),
+                source="exchange_estimated_risk",
+            )
+        return list(exposures_by_symbol.values())
+
+    @staticmethod
+    def _trade_entry_session(trade: Trade) -> str:
+        extra = trade.extra or {}
+        return str(extra.get("entry_session") or "unknown")
+
+    @staticmethod
+    def _trade_open_risk(trade: Trade) -> float:
+        return BotRunner._position_open_risk(trade.entry_price, trade.stop_loss, trade.quantity)
+
+    @staticmethod
+    def _position_open_risk(entry_price: float, stop_loss: float, quantity: float) -> float:
+        return max(0.0, abs(entry_price - stop_loss) * max(0.0, quantity))
+
+    @staticmethod
+    def _exchange_only_open_risk(position: Position) -> float:
+        # Without a local stop, assume a conservative 1% adverse move for exposure gating.
+        return max(0.0, position.quantity * position.mark_price * 0.01)
+
+    @staticmethod
+    def _active_symbol_count(open_trades: list[Trade], exchange_positions: list[Position]) -> int:
+        return len({trade.symbol for trade in open_trades} | {position.symbol for position in exchange_positions})
+
+    def _loss_streak_since(self, session: SessionState, day_start: datetime) -> datetime:
+        if self.settings.consecutive_loss_stop_scope == "day" or session.name == "off_session":
+            return day_start
+        return max(day_start, session.start_utc)
+
+    def _update_loss_status(self) -> None:
+        self.status.consecutive_losses = self._consecutive_losses
+        self.status.recent_consecutive_losses = self._recent_consecutive_losses
+        self.status.loss_streak_scope_start = self._loss_streak_scope_start
+        self.status.loss_cooldown_since = self._loss_cooldown_since
+
+    def _scan_only_reasons(
+        self,
+        *,
+        active_symbol_count: int,
+        open_order_count: int,
+        today_trade_count: int,
+        daily_pnl_pct: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if active_symbol_count >= self.settings.max_concurrent_trades:
+            reasons.append("max concurrent trade limit reached")
+        if open_order_count >= self.settings.max_concurrent_trades:
+            reasons.append("open order limit reached")
+        if today_trade_count >= self.settings.max_trades_per_day:
+            reasons.append("daily trade limit reached")
+        if daily_pnl_pct <= self.settings.daily_hard_loss_limit_pct:
+            reasons.append("daily hard loss limit reached")
+        if daily_pnl_pct >= self.settings.daily_profit_target_pct:
+            reasons.append("daily profit target reached; protecting gains")
+        return reasons
+
+    def _update_cycle_status(self, session: SessionState, regime: RegimeResult) -> None:
+        self.status.cycle_count += 1
+        self.status.last_cycle_at = datetime.now(timezone.utc)
+        self.status.current_session = session.name if session.active or session.tradable else "closed"
+        self.status.current_regime = regime.regime
+        self.status.last_error = None
+
+    def _order_cooldown_active(self) -> bool:
+        if self._last_order_at is None:
+            return False
+        elapsed = (datetime.now(timezone.utc) - self._last_order_at).total_seconds()
+        return elapsed < self.settings.bot_min_seconds_between_orders
+
+    def _leader_confirmed(self, context: StrategyContext, direction: Direction) -> bool:
+        return self._leader_state(context, direction) == "aligned"
+
+    def _leader_confirmation_valid(
+        self,
+        context: StrategyContext,
+        direction: Direction,
+        score: SetupScoreResult,
+    ) -> bool:
+        leader_state = self._leader_state(context, direction)
+        if leader_state == "aligned":
+            return True
+        if leader_state == "conflict":
+            return False
+        return score.total >= self.risk_engine.score_threshold_for_grade("A", context.session_name)
+
+    def _regime_allows_new_trades(self, regime: RegimeResult) -> bool:
+        if not regime.tradable:
+            return False
+        return regime.regime != "unclear" or self.settings.allow_unclear_regime_trading
+
+    def _leader_state(self, context: StrategyContext, direction: Direction) -> str:
+        leaders = [leader for leader in (context.btc_direction, context.eth_direction) if leader is not None]
+        if any(leader == direction for leader in leaders):
+            return "aligned"
+        if any(leader != direction for leader in leaders):
+            return "conflict"
+        return "neutral"
+
+    def _expected_net_profit_pct(self, signal: StrategySignal, spread_bps: float, slippage_bps: float) -> float:
+        gross_pct = signal.expected_move / signal.entry_price * 100 if signal.entry_price else 0.0
+        cost_pct = (self.settings.fee_rate_bps * 2 + slippage_bps + spread_bps) / 100
+        return gross_pct - cost_pct
+
+    def _take_profit_levels(self, trade: Trade) -> list[float]:
+        take_profit = trade.take_profit or {}
+        if isinstance(take_profit, dict):
+            return [float(item) for item in take_profit.get("levels", [])]
+        if isinstance(take_profit, list):
+            return [float(item) for item in take_profit]
+        return []
+
+    def _close_reason(self, trade: Trade, price: float) -> str | None:
+        if trade.side == "long" and price <= trade.stop_loss:
+            return "stop_loss"
+        if trade.side == "short" and price >= trade.stop_loss:
+            return "stop_loss"
+        levels = self._take_profit_levels(trade)
+        if levels and self._target_hit(trade.side, price, levels[-1]):
+            return "final_take_profit"
+        return None
+
+    def _target_hit(self, side: str, price: float, target: float) -> bool:
+        return price >= target if side == "long" else price <= target
+
+    async def _maybe_move_break_even(self, trade: Trade, price: float) -> None:
+        extra = dict(trade.extra or {})
+        if extra.get("break_even_moved"):
+            return
+        risk = abs(trade.entry_price - trade.stop_loss)
+        if risk <= 0:
+            return
+        profit = price - trade.entry_price if trade.side == "long" else trade.entry_price - price
+        if profit >= risk * self.settings.break_even_trigger_r:
+            trade.stop_loss = trade.entry_price
+            extra["break_even_moved"] = True
+            trade.extra = extra
+
+    def _unrealized_pnl(self, trade: Trade, price: float) -> float:
+        return round(self._exit_pnl(trade, price, trade.quantity), 4)
+
+    @staticmethod
+    def _trade_assessment_label(trade: Trade) -> str:
+        extra = trade.extra or {}
+        score = extra.get("setup_score")
+        grade = extra.get("grade")
+        risk_pct = extra.get("risk_pct")
+        parts = []
+        if score is not None:
+            parts.append(f"score {score}")
+        if grade:
+            parts.append(f"grade {grade}")
+        if risk_pct is not None:
+            parts.append(f"risk {float(risk_pct):.2f}%")
+        return f"({' '.join(parts)})" if parts else ""
+
+    def _exit_pnl(self, trade: Trade, price: float, quantity: float) -> float:
+        gross = (price - trade.entry_price) * quantity
+        if trade.side == "short":
+            gross *= -1
+        fee = price * quantity * self.settings.fee_rate_bps / 10_000
+        return gross - fee
+
+    def _session_range(self, candles: list[Candle], start: time, end: time) -> tuple[float | None, float | None]:
+        filtered = [candle for candle in candles if start <= candle.timestamp.time().replace(tzinfo=None) <= end]
+        if not filtered:
+            return None, None
+        return max(candle.high for candle in filtered), min(candle.low for candle in filtered)
+
+    def _abnormal_wick_ratio(self, candles: list[Candle]) -> float:
+        if not candles:
+            return 0.0
+        abnormal = 0
+        for candle in candles:
+            body = abs(candle.close - candle.open)
+            wick = candle.high - candle.low
+            if wick > 0 and body / wick < 0.25:
+                abnormal += 1
+        return abnormal / len(candles)
+
+    async def _cancel_loop(self) -> None:
+        task = self._task
+        self._task = None
+        if task and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        self.status.loop_task_active = False
+
+    def _remember(self, message: str) -> None:
+        self.status.messages.append(message)
+        self.status.messages = self.status.messages[-20:]
+
+
+bot_runner = BotRunner()
