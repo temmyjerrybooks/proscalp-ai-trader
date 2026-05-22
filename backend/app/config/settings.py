@@ -119,6 +119,9 @@ class Settings(BaseSettings):
     max_open_risk_off_session_pct: float = 1.25
     min_risk_reward: float = 1.2
     break_even_trigger_r: float = 0.8
+    # Phase 2A — neutralize "size up on high confidence": scores at/above this
+    # value are sized at the A-tier minimum risk (no upward interpolation).
+    cap_risk_at_score: int = 75
     trade_stagnation_minutes: int = 45
 
     normal_score_threshold_c: int = 55

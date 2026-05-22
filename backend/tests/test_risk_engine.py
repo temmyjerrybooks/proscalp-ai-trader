@@ -49,16 +49,20 @@ def test_position_sizing_uses_stop_distance():
     assert result.notional <= 10_000 * 0.10
 
 
-def test_setup_risk_assessment_interpolates_normal_session_risk():
+def test_risk_is_capped_at_a_tier_minimum_above_score_75():
+    # Phase 2A: scores >= cap_risk_at_score (75) are all sized at the A-tier
+    # minimum (0.30) regardless of grade — no upward interpolation.
     engine = RiskEngine()
     state = engine.evaluate_daily_state(daily_pnl_pct=0, consecutive_losses=0)
 
-    low = engine.assess_setup_score(85, "london", state)
-    high = engine.assess_setup_score(100, "london", state)
+    a_plus = engine.assess_setup_score(100, "london", state)
+    a = engine.assess_setup_score(80, "london", state)
+    a_floor = engine.assess_setup_score(75, "london", state)
 
-    assert low.grade == "A+"
-    assert low.risk_pct == 0.40
-    assert high.risk_pct == 0.50
+    assert a_plus.grade == "A+"  # grade label preserved
+    assert a_plus.risk_pct == 0.30
+    assert a.risk_pct == 0.30
+    assert a_floor.risk_pct == 0.30
 
 
 def test_setup_risk_assessment_uses_stricter_off_session_tiers():
@@ -83,8 +87,10 @@ def test_setup_risk_assessment_respects_drawdown_multiplier():
 
     assessment = engine.assess_setup_score(100, "london", state)
 
-    assert assessment.base_risk_pct == 0.50
-    assert assessment.risk_pct == 0.25
+    # base risk is capped to the A-tier minimum (0.30), then the drawdown
+    # multiplier (0.5 at -2.1%) is applied -> 0.15.
+    assert assessment.base_risk_pct == 0.30
+    assert assessment.risk_pct == 0.15
 
 
 def test_max_concurrent_trades_blocks_new_trade():
