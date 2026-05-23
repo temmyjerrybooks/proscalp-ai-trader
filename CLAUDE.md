@@ -48,13 +48,15 @@ ProScalp is a Python crypto scalping bot. Stack: FastAPI + asyncio, SQLAlchemy +
 
 ## Deployment mechanics
 
-Windows source is canonical. Oracle target: `/opt/proscalp-ai-trader/`. **Deploy via `rsync -a --delete`** from Windows post-merge `main` to Oracle (NOT the legacy [scripts/deploy_oracle_from_windows.ps1](scripts/deploy_oracle_from_windows.ps1) — its tar-overlay doesn't delete removed files).
+Windows source is canonical. Oracle target: `/opt/proscalp-ai-trader/`. **The deployment contract is `rsync -a --delete`** from Windows post-merge `main` to `/opt/proscalp-ai-trader/backend/` (NOT the legacy [scripts/deploy_oracle_from_windows.ps1](scripts/deploy_oracle_from_windows.ps1) — its `tar -xz` overlay doesn't delete removed files, leaving stale orphans). Always preview with `rsync -avn --delete …` and show the operator before the real run.
 
 Production image: `proscalp-ai-trader-backend:latest`, built from [backend/Dockerfile](backend/Dockerfile), **Python 3.12.13**.
 
-**Test gate (always before prod deploy):** stage in separate dir (e.g. `/opt/proscalp-phase2a-test/`), `docker build -t proscalp:<phase>-test -f backend/Dockerfile backend/`, run pytest **bind-mounting** `tests/` + `pyproject.toml` read-only (Dockerfile only copies `app/`; tests aren't baked in).
+**Settled test-gate pattern (always before prod deploy):** stage in a separate dir (e.g. `/opt/proscalp-<phase>-test/`), `docker build -t proscalp:<phase>-test -f backend/Dockerfile backend/`, then run pytest **bind-mounting** `tests/` + `pyproject.toml` read-only into the sealed image (the Dockerfile only `COPY app ./app` — tests are intentionally not baked in, keeping prod lean). Verify hashes match between staging and Windows source before building.
 
-**Containers (docker compose):** `postgres`, `backend`, `frontend`, `nginx`. **Only restart `backend` for code deploys** — never touch the other three.
+**Containers (docker compose):** `postgres`, `backend`, `frontend`, `nginx`.
+- **Only `backend` is restarted for code deploys.** Never touch the other three.
+- **Use `docker compose up -d --no-deps backend`.** Without `--no-deps`, compose follows the `depends_on: postgres: service_healthy` chain and **recreates postgres** as a side effect. Data survives via the named `postgres_data` volume, but it's unnecessary churn and violates the "only-backend" rule. (Lesson from Phase 2A deploy.)
 
 **DB raw-SQL gotcha:** `trades.extra` maps to column literally named `metadata`. Use `trades.metadata->>'grade'`.
 
