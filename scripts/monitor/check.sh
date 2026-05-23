@@ -1,0 +1,114 @@
+#!/bin/bash
+# Phase 2A passive monitor — runs every 15 min via cron on Oracle.
+# Alerts go to Telegram (creds read from /opt/proscalp-ai-trader/.env).
+# Never prints secret values.
+set -e
+ENV_FILE=/opt/proscalp-ai-trader/.env
+START_TS_FILE=/opt/proscalp-snapshots/phase2a-bot-start-ts.txt
+STATE_DIR=/opt/proscalp-monitor/state
+ALERTS_FILE=/opt/proscalp-monitor/alerts.log
+CHECK_LOG=/opt/proscalp-monitor/check.log
+LAST_CLOSED_FILE="$STATE_DIR/last_closed_count"
+DEDUP_FILE="$STATE_DIR/alert_dedup"
+
+mkdir -p "$STATE_DIR"
+touch "$DEDUP_FILE"
+
+# Load Telegram creds without echoing.
+if [ -f "$ENV_FILE" ]; then
+  set -a; . "$ENV_FILE"; set +a
+fi
+
+START_TS=$(cat "$START_TS_FILE" 2>/dev/null || echo "")
+NOW=$(date -u +%FT%TZ)
+
+# Dedup: don't re-send the same alert within the same hour.
+send_alert() {
+  local msg="$1"
+  local key="$2"
+  local sig="${key}|$(date -u +%Y%m%d%H)"
+  if grep -qF "$sig" "$DEDUP_FILE" 2>/dev/null; then
+    return
+  fi
+  tail -100 "$DEDUP_FILE" > "${DEDUP_FILE}.tmp" 2>/dev/null || true
+  mv "${DEDUP_FILE}.tmp" "$DEDUP_FILE" 2>/dev/null || true
+  echo "$sig" >> "$DEDUP_FILE"
+  echo "[$NOW] $msg" >> "$ALERTS_FILE"
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+    curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=ProScalp Phase 2A: ${msg}" -o /dev/null || true
+  fi
+}
+
+# 1) Log anomalies in the last 16 minutes (slight overlap with 15-min cron).
+LOG_TMP=$(mktemp)
+docker logs --since 16m proscalp-ai-trader-backend-1 > "$LOG_TMP" 2>&1
+while IFS=':' read -r pat desc; do
+  count=$(grep -cE "$pat" "$LOG_TMP" 2>/dev/null || echo 0)
+  count=${count:-0}
+  if [ "$count" -gt 0 ] 2>/dev/null; then
+    send_alert "${desc} (pattern '${pat}' x${count} in last 15m)" "log_${pat// /_}"
+  fi
+done <<'PATTERNS'
+Traceback:bot exception
+Exception:bot exception
+EMA pullback scalp:disabled setup fired
+London open breakout:disabled setup fired
+US open breakout:disabled setup fired
+session aggression mode active:aggression mode fired
+PATTERNS
+rm -f "$LOG_TMP"
+
+# 2) Bot loop health.
+STATUS_JSON=$(curl -sS --max-time 10 http://localhost/api/bot/status 2>/dev/null || echo "{}")
+LOOP_ACTIVE=$(echo "$STATUS_JSON" | python3 -c "import json,sys
+try:
+    print(json.load(sys.stdin).get('loop_task_active'))
+except Exception:
+    print('?')" 2>/dev/null)
+BOT_STATUS=$(echo "$STATUS_JSON" | python3 -c "import json,sys
+try:
+    print(json.load(sys.stdin).get('status'))
+except Exception:
+    print('?')" 2>/dev/null)
+if [ "$LOOP_ACTIVE" != "True" ] || [ "$BOT_STATUS" != "running" ]; then
+  send_alert "bot status=${BOT_STATUS} loop_active=${LOOP_ACTIVE}" "bot_stopped"
+fi
+
+# 3) DB invariant checks + counters (single query for efficiency).
+DB=$(docker exec proscalp-ai-trader-postgres-1 psql -U proscalp -d proscalp -At -F'|' -c "
+WITH s AS (SELECT '${START_TS}'::timestamp AT TIME ZONE 'UTC' AS start_ts)
+SELECT
+  (SELECT COUNT(*) FROM trades, s WHERE opened_at >= s.start_ts AND (metadata->>'risk_pct')::numeric > 0.31),
+  (SELECT COUNT(*) FROM orders, s WHERE created_at >= s.start_ts AND order_type = 'market'),
+  (SELECT COUNT(*) FROM trades, s WHERE status='closed' AND closed_at::date = (now() AT TIME ZONE 'UTC')::date AND opened_at >= s.start_ts AND realized_pnl < -10),
+  (SELECT COUNT(*) FROM trades, s WHERE status='closed' AND opened_at >= s.start_ts),
+  COALESCE((SELECT ROUND(100.0 * SUM(CASE WHEN status='filled' THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1)
+            FROM orders WHERE created_at >= (now() - interval '4 hours')), 100),
+  (SELECT COUNT(*) FROM orders WHERE created_at >= (now() - interval '4 hours')),
+  COALESCE((SELECT CASE WHEN COUNT(*)=3 AND BOOL_AND(realized_pnl < -1) THEN 1 ELSE 0 END
+            FROM (SELECT realized_pnl FROM trades, s WHERE status='closed' AND opened_at >= s.start_ts ORDER BY closed_at DESC LIMIT 3) recent), 0)
+")
+IFS='|' read OVER_RISK MARKET_ORD BAD_DAY CLOSED FILL_RATE ORDERS_4H LOSS_3 <<< "$DB"
+
+[ "${OVER_RISK:-0}" -gt 0 ] 2>/dev/null && send_alert "trades with risk_pct > 0.31: ${OVER_RISK}" "over_risk"
+[ "${MARKET_ORD:-0}" -gt 0 ] 2>/dev/null && send_alert "MARKET-type orders detected: ${MARKET_ORD}" "market_orders"
+[ "${BAD_DAY:-0}" -gt 0 ] 2>/dev/null && send_alert "single-trade loss > \$10 today (n=${BAD_DAY})" "bad_loss_day_$(date -u +%Y%m%d)"
+[ "${LOSS_3:-0}" = "1" ] && send_alert "3 consecutive closed trades each lost > \$1" "loss_streak_3"
+
+# IOC fill rate (only alert with at least 5 orders sampled).
+if [ -n "${FILL_RATE:-}" ] && [ "${ORDERS_4H:-0}" -ge 5 ] 2>/dev/null; then
+  if python3 -c "import sys; sys.exit(0 if float('${FILL_RATE}') < 30 else 1)" 2>/dev/null; then
+    send_alert "IOC fill rate ${FILL_RATE}% over last 4h (n=${ORDERS_4H})" "low_fill_rate"
+  fi
+fi
+
+# 50-trade milestone (one-shot).
+LAST_COUNT=$(cat "$LAST_CLOSED_FILE" 2>/dev/null || echo 0)
+echo "${CLOSED:-0}" > "$LAST_CLOSED_FILE"
+if [ "${CLOSED:-0}" -ge 50 ] 2>/dev/null && [ "${LAST_COUNT:-0}" -lt 50 ] 2>/dev/null; then
+  send_alert "MILESTONE: 50 closed trades reached since deploy. Time for Phase 2A evaluation report." "milestone_50"
+fi
+
+echo "[$NOW] check OK closed=${CLOSED:-0} fill_rate_4h=${FILL_RATE:-?}% orders_4h=${ORDERS_4H:-0}" >> "$CHECK_LOG"
