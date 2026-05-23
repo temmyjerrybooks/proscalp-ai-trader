@@ -119,6 +119,9 @@ class Settings(BaseSettings):
     max_open_risk_off_session_pct: float = 1.25
     min_risk_reward: float = 1.2
     break_even_trigger_r: float = 0.8
+    # Phase 2A — neutralize "size up on high confidence": scores at/above this
+    # value are sized at the A-tier minimum risk (no upward interpolation).
+    cap_risk_at_score: int = 75
     trade_stagnation_minutes: int = 45
 
     normal_score_threshold_c: int = 55
@@ -131,7 +134,16 @@ class Settings(BaseSettings):
     off_session_score_threshold_a: int = 80
     off_session_score_threshold_aplus: int = 90
     off_session_timing_score: float = 65.0
+    # Phase 2A — disable session-open aggression (London-open aggression was the
+    # worst real-trade cell: -$30.68, 9% win). When False, session_score uses the
+    # base value regardless of time-since-open.
+    aggression_mode_enabled: bool = False
     allow_unclear_regime_trading: bool = False
+
+    # Phase 2A — strategy enablement (disabled setups are dropped from the live
+    # registry and self-reject in evaluate(); see docs/baseline-pre-phase-2a.md).
+    ema_pullback_enabled: bool = False
+    london_open_breakout_enabled: bool = False
 
     asia_session_start_utc: str = "00:00"
     asia_session_end_utc: str = "04:00"
@@ -142,6 +154,9 @@ class Settings(BaseSettings):
 
     order_timeout_seconds: int = 20
     market_order_min_score: int = 88
+    # Phase 2A — when True, every order routes as an IOC limit regardless of
+    # score (market routing on high scores paid full slippage on losing A+ trades).
+    force_limit_orders: bool = True
     scalp_limit_time_in_force: Literal["GTC", "IOC", "FOK"] = "IOC"
     aggressive_limit_slippage_bps: float = 2.5
     max_signal_price_drift_bps: float = 12.0

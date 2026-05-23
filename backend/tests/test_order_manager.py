@@ -107,11 +107,29 @@ def _permission(setup_score: int = 80) -> TradePermissionRequest:
 
 
 @pytest.mark.asyncio
-async def test_high_setup_score_uses_market_order_even_when_signal_confidence_is_lower() -> None:
+async def test_high_score_routes_as_limit_when_force_limit_orders_default() -> None:
+    # Phase 2A default: force_limit_orders=True -> even a high score is an IOC limit.
     exchange = RecordingExchange()
     manager = OrderManager(
         exchange,
         settings=Settings(trading_mode=TradingMode.TESTNET, market_order_min_score=88),
+    )
+
+    report = await manager.execute_signal(_signal(confidence=72), _permission(setup_score=90), quantity=0.1)
+
+    assert report.accepted is True
+    assert exchange.last_order is not None
+    assert exchange.last_order.order_type == "limit"
+
+
+@pytest.mark.asyncio
+async def test_high_setup_score_uses_market_order_only_when_force_limit_disabled() -> None:
+    exchange = RecordingExchange()
+    manager = OrderManager(
+        exchange,
+        settings=Settings(
+            trading_mode=TradingMode.TESTNET, market_order_min_score=88, force_limit_orders=False
+        ),
     )
 
     report = await manager.execute_signal(_signal(confidence=72), _permission(setup_score=90), quantity=0.1)

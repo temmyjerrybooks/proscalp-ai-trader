@@ -55,7 +55,10 @@ class OrderManager:
             return ExecutionReport(False, self.settings.trading_mode.value, decision, reasons=decision.reasons)
 
         execution_score = max(signal.confidence_score, permission_request.setup_score)
-        order_type = "market" if execution_score >= self.settings.market_order_min_score else "limit"
+        if self.settings.force_limit_orders:
+            order_type = "limit"
+        else:
+            order_type = "market" if execution_score >= self.settings.market_order_min_score else "limit"
         side = "buy" if signal.direction == "long" else "sell"
         client_order_id = f"proscalp-{uuid4().hex[:20]}"
 

@@ -20,7 +20,7 @@ def test_strategy_signal_generation_london_breakout(trending_candles):
         asian_low=min(candle.low for candle in candles[-50:]),
     )
 
-    signal = LondonBreakoutStrategy().evaluate(context)
+    signal = LondonBreakoutStrategy(enabled=True).evaluate(context)
 
     assert signal.accepted is True
     assert signal.direction == "long"

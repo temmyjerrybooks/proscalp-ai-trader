@@ -141,6 +141,12 @@ class RiskEngine:
             ceiling = 100 if index == 0 else max(floor, tiers[index - 1][1] - 1)
             if score >= floor:
                 base_risk = self._interpolate_risk(score, floor, ceiling, risk_min, risk_max)
+                if score >= self.settings.cap_risk_at_score:
+                    # Phase 2A: do not size up on high-confidence setups (A+ shows
+                    # 20% win rate / -$0.95 avg on real money). Clamp to the A-tier
+                    # minimum risk so every score >= cap gets the score-75 sizing.
+                    a_tier_risk_min = next((tier[2] for tier in tiers if tier[0] == "A"), risk_min)
+                    base_risk = min(base_risk, a_tier_risk_min)
                 return SetupRiskAssessment(
                     score=score,
                     grade=grade,

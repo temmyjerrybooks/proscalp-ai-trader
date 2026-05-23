@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from app.config.settings import get_settings
 from app.strategies.base_strategy import BaseStrategy, StrategyContext, StrategySignal
 
 
 class EMAPullbackStrategy(BaseStrategy):
     name = "EMA pullback scalp"
 
+    def __init__(self, enabled: bool | None = None) -> None:
+        # Defaults to the settings flag; callers (backtests/tests) may force-enable.
+        self.enabled = get_settings().ema_pullback_enabled if enabled is None else enabled
+
     def evaluate(self, context: StrategyContext) -> StrategySignal:
+        if not self.enabled:
+            return self.reject(context, ["EMA pullback disabled by configuration"])
         candles = self.candles(context)
         snapshot = self.snapshot(context)
         if len(candles) < 50 or not snapshot:
