@@ -46,6 +46,23 @@ ProScalp is a Python crypto scalping bot. Stack: FastAPI + asyncio, SQLAlchemy +
 
 **Pre-Phase-2A baseline (71 testnet trades, 2026-05-16…19):** net **−$32.58**, win **35.2%**. Full breakdown: [docs/baseline-pre-phase-2a.md](docs/baseline-pre-phase-2a.md).
 
+**Phase 2A evaluation (first 50 closes, 2026-05-23…24):** net **+$18.16**, win **56.0%**, PF **1.57**. Full breakdown: [docs/phase-2a-evaluation.md](docs/phase-2a-evaluation.md).
+
+### Phase 2B Branch 1 — IMPLEMENTED, NOT DEPLOYED (branch `phase-2b-foundation`)
+
+Foundation work (items 1–4 + clarifications) merged-ready but awaiting staging+deploy approval. All new flags default OFF for trading-impact, ON for measurement.
+
+- `exchange_resting_exits_enabled = False` — when ON (non-paper futures only), after entry fill posts `STOP_MARKET` + `TAKE_PROFIT_MARKET` (`closePosition=True`, `workingType=MARK_PRICE`) via `OrderManager.attach_protective_orders`. Polling loop switches to *sync-from-exchange* for resting trades. **No partial exits in Branch 1** — Branch 2 adds the 5-tier TP ladder.
+- `mfe_mae_logging_enabled = True` — per-cycle `mfe_pnl` / `mae_pnl` tracked on `trade.extra` (no schema migration). Works for both exit paths.
+- `paper_sim_wired_to_live_loop = False` — when ON, paper-mode exits route through `PaperTradingSimulator.update_price` (eliminates the split-brain where sim equity tracked only fees).
+- `shadow_replay_fee_aware = True` — `follow_up.pnl_pct` is fee+slippage-net by default; `pnl_pct_gross` preserved for transparency.
+- `startup_reconciliation_enabled = True` — runs once in `BotRunner.start()` when resting is ON. Three states: (1) reconciled, (2) `protective_orders_repaired`, (3) `orphan_orders_cancelled`. Identifies our orders by `client_order_id` prefix `proscalp-sl-` / `proscalp-tp-` (foreign orders never touched).
+- `startup_adapter_test_enabled = True` — places + immediately cancels a far-from-market `STOP_MARKET` on BTCUSDT to validate the adapter wiring before the main loop starts. Failure logs loudly but does not block startup.
+- `orphan_reconcile_stop_pct = 0.0035`, `orphan_reconcile_tp_levels = [0.003, 0.005, 0.008]` — formerly hardcoded in `_reconcile_pending_and_orphan_positions`, now settings (Branch 1 clarification A). Orphans receive protective orders when resting is ON.
+- `protective_order_max_elapsed_ms = 2000` — `OrderManager.attach_protective_orders` is **sequential** (stop first, then TP) and warns via `protective_order_slow` when total elapsed exceeds this.
+
+`PositionManager` (`execution/position_manager.py`) is still dead code; Branch 2 decision pending.
+
 ## Deployment mechanics
 
 Windows source is canonical. Oracle target: `/opt/proscalp-ai-trader/`. **The deployment contract is `rsync -a --delete`** from Windows post-merge `main` to `/opt/proscalp-ai-trader/backend/` (NOT the legacy [scripts/deploy_oracle_from_windows.ps1](scripts/deploy_oracle_from_windows.ps1) — its `tar -xz` overlay doesn't delete removed files, leaving stale orphans). Always preview with `rsync -avn --delete …` and show the operator before the real run.
@@ -64,12 +81,11 @@ Production image: `proscalp-ai-trader-backend:latest`, built from [backend/Docke
 
 ## Next planned work (Phase 2B)
 
-1. Replace mid-price-polling exits with exchange-resting TP/SL orders (RF#3 — primary remaining bleed).
-2. Wire `PaperTradingSimulator.update_price` into the live paper loop (currently only used by backtester — split-brain equity).
-3. Make shadow replay fee-aware so `follow_up_pnl_pct` is directly comparable to realized.
-4. Add measurement infrastructure (daily reconciliation, dashboards).
+**Branch 1 — `phase-2b-foundation`:** IMPLEMENTED locally; awaiting staging+deploy approval. (Items 1-4 + clarifications A/B/C + startup adapter test.)
 
-**Do NOT start Phase 2B until Phase 2A has accumulated ≥50 closed trades post-deploy AND the operator has reviewed the results.**
+**Branch 2 — `phase-2b-exits`:** not started. Builds on Branch 1: BE+ stop, 5-tier TP ladder, stop progression, trailing stop on runner, time-based exits, slippage anomaly logging.
+
+**Branch 3 — `phase-2b-safety`:** not started. Flash-crash detection + daily reconciliation alert.
 
 ## Operational ground rules
 
