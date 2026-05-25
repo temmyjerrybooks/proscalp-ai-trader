@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time as _time
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time, timedelta, timezone
+from uuid import uuid4
 
 import structlog
 from sqlalchemy import desc, func, select
@@ -292,8 +294,57 @@ class BotRunner:
         await db.commit()
 
     async def _startup_adapter_test(self, adapter: ExchangeAdapter) -> None:
-        """Stub — implemented in C8."""
-        return
+        """Phase 2B Branch 1: catch adapter implementation bugs before they affect real positions.
+
+        Posts a far-from-market STOP_MARKET (closePosition=True) on BTCUSDT and
+        immediately cancels it. The stopPrice is at mid * 0.5 — would only trigger
+        on a 50% drop in seconds, so it cannot fill during the placement window.
+        Logs success/failure but does not block the main loop from starting
+        (degraded path: if exchange-resting is broken, regular signals will
+        surface the same error and fall back to legacy polling).
+        """
+        symbol = "BTCUSDT"
+        try:
+            book = await adapter.fetch_order_book(symbol, limit=5)
+            mark = book.mid_price
+            if mark <= 0:
+                raise ValueError("mid price not available")
+        except Exception as exc:
+            logger.warning("startup_adapter_test_skip", reason=f"book fetch failed: {exc}")
+            return
+
+        request = OrderRequest(
+            symbol=symbol,
+            side="sell",
+            order_type="stop_market",
+            stop_price=mark * 0.5,  # far below market; cannot trigger in the placement window
+            close_position=True,
+            working_type="MARK_PRICE",
+            client_order_id=f"proscalp-test-{uuid4().hex[:18]}",
+        )
+        start = _time.perf_counter()
+        try:
+            result = await adapter.place_order(request)
+        except Exception as exc:
+            elapsed_ms = (_time.perf_counter() - start) * 1000.0
+            logger.error(
+                "startup_adapter_test_failed",
+                stage="place", error=str(exc), elapsed_ms=round(elapsed_ms, 1),
+            )
+            return
+
+        try:
+            await adapter.cancel_order(symbol, result.order_id)
+            elapsed_ms = (_time.perf_counter() - start) * 1000.0
+            logger.info(
+                "startup_adapter_test_ok",
+                order_id=result.order_id, elapsed_ms=round(elapsed_ms, 1),
+            )
+        except Exception as exc:
+            logger.warning(
+                "startup_adapter_test_cancel_failed",
+                order_id=result.order_id, error=str(exc),
+            )
 
     async def stop(self) -> BotRuntimeStatus:
         self.status.enabled = False
