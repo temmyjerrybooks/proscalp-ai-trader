@@ -158,10 +158,142 @@ class BotRunner:
         self.status.emergency_stopped = False
         self.status.last_error = None
         self._remember("Bot started; autonomous loop armed")
+
+        # Phase 2B Branch 1: startup reconciliation + adapter smoke test.
+        # Wrapped so a failure logs loudly but does not block the main loop —
+        # the loop's per-cycle sync will eventually pick up state divergence.
+        try:
+            await self._run_startup_checks()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("startup_checks_failed", error=str(exc))
+            self._remember(f"Startup checks failed: {exc}")
+
         self._task = asyncio.create_task(self._run_loop(), name="proscalp-autonomous-loop")
         logger.info("bot_started", mode=self.status.mode, exchange=self.status.exchange)
         await self.alerts.send("bot_started", f"ProScalp AI Trader started in {self.status.mode} mode")
         return self.status
+
+    async def _run_startup_checks(self) -> None:
+        """Phase 2B Branch 1: startup reconciliation + adapter smoke test.
+
+        Only runs in non-paper futures mode. Either check is independently
+        gated by its own settings flag.
+        """
+        if self.settings.trading_mode == TradingMode.PAPER or not self.settings.is_futures_mode:
+            return
+        adapter = create_exchange_adapter(self.settings)
+        if self.settings.startup_adapter_test_enabled and self.settings.exchange_resting_exits_enabled:
+            await self._startup_adapter_test(adapter)
+        if self.settings.startup_reconciliation_enabled and self.settings.exchange_resting_exits_enabled:
+            async with AsyncSessionLocal() as db:
+                await self._startup_reconciliation(db, adapter)
+
+    async def _startup_reconciliation(self, db: AsyncSession, adapter: ExchangeAdapter) -> None:
+        """Phase 2B Branch 1 clarification C: 3-state startup reconciliation.
+
+        State 1: DB open trade + matching protective orders -> log 'startup_reconciled'.
+        State 2: DB open trade + no matching protective orders -> attach + 'protective_orders_repaired'.
+        State 3: protective orders on exchange + no DB trade -> cancel + 'orphan_orders_cancelled'.
+        """
+        try:
+            db_trades = await self._open_database_trades(db)
+            exchange_positions = await adapter.fetch_positions()
+            exchange_orders = await adapter.fetch_open_orders()
+        except Exception as exc:
+            logger.error("startup_reconciliation_fetch_failed", error=str(exc))
+            return
+
+        position_symbols = {p.symbol for p in exchange_positions}
+        protective_by_symbol: dict[str, list] = {}
+        for order in exchange_orders:
+            cid = str((order.raw or {}).get("clientOrderId", ""))
+            if cid.startswith("proscalp-sl-") or cid.startswith("proscalp-tp-"):
+                protective_by_symbol.setdefault(order.symbol, []).append(order)
+        db_open_symbols = {t.symbol for t in db_trades}
+
+        reconciled = 0
+        repaired = 0
+        orphan_cancelled = 0
+        manager = OrderManager(adapter, risk_engine=self.risk_engine, paper=self.paper, settings=self.settings)
+
+        for trade in db_trades:
+            if trade.symbol not in position_symbols:
+                continue  # position closed externally; per-cycle sync will finalize
+            existing = protective_by_symbol.get(trade.symbol, [])
+            existing_ids = {o.order_id for o in existing}
+            extra = trade.extra or {}
+            stored = {extra.get("stop_order_id"), extra.get("take_profit_order_id")} - {None, ""}
+            if stored and stored.issubset(existing_ids):
+                reconciled += 1
+                logger.info("startup_reconciled", trade_id=trade.id, symbol=trade.symbol)
+                continue
+            # State 2: missing one or both protective orders -> repair.
+            levels = self._take_profit_levels(trade)
+            synthetic = StrategySignal(
+                setup_name=trade.setup_name,
+                symbol=trade.symbol,
+                direction=trade.side,  # type: ignore[arg-type]
+                entry_price=trade.entry_price,
+                stop_loss=trade.stop_loss,
+                take_profit_levels=levels,
+                trailing_stop=0.0,
+                expected_move=0.0,
+                risk_reward_ratio=0.0,
+                confidence_score=0.0,
+                accepted=True,
+            )
+            protective = await manager.attach_protective_orders(synthetic, trade.id)
+            new_extra = dict(extra)
+            new_extra["protective_orders_attached_ms"] = round(protective.elapsed_ms, 1)
+            if protective.success:
+                new_extra["exchange_resting_active"] = True
+                new_extra["stop_order_id"] = protective.stop_order_id
+                new_extra["take_profit_order_id"] = protective.take_profit_order_id
+                repaired += 1
+                logger.info(
+                    "protective_orders_repaired",
+                    trade_id=trade.id, symbol=trade.symbol,
+                    stop_order_id=protective.stop_order_id,
+                    take_profit_order_id=protective.take_profit_order_id,
+                )
+            else:
+                new_extra["exchange_resting_active"] = False
+                new_extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
+                logger.warning(
+                    "startup_protective_repair_failed",
+                    trade_id=trade.id, symbol=trade.symbol, reasons=protective.reasons,
+                )
+            trade.extra = new_extra
+
+        # State 3: orphan protective orders on the exchange with no DB counterpart.
+        for symbol, orders in protective_by_symbol.items():
+            if symbol in db_open_symbols:
+                continue
+            for order in orders:
+                try:
+                    await adapter.cancel_order(symbol, order.order_id)
+                    orphan_cancelled += 1
+                    logger.info(
+                        "orphan_orders_cancelled",
+                        symbol=symbol, order_id=order.order_id,
+                        client_order_id=(order.raw or {}).get("clientOrderId"),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "orphan_order_cancel_failed",
+                        symbol=symbol, order_id=order.order_id, error=str(exc),
+                    )
+
+        await self._risk_event(
+            db, "info", "startup_reconciliation",
+            f"reconciled={reconciled} repaired={repaired} orphan_cancelled={orphan_cancelled}",
+            {"reconciled": reconciled, "repaired": repaired, "orphan_cancelled": orphan_cancelled},
+        )
+        await db.commit()
+
+    async def _startup_adapter_test(self, adapter: ExchangeAdapter) -> None:
+        """Stub — implemented in C8."""
+        return
 
     async def stop(self) -> BotRuntimeStatus:
         self.status.enabled = False
