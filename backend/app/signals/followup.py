@@ -3,8 +3,24 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.config.settings import get_settings
 from app.database.models import Signal, Trade
 from app.exchanges.base import Candle
+
+
+def _shadow_cost_pct() -> float:
+    """Phase 2B Branch 1: round-trip fee+slippage in percentage points.
+
+    Shadow replays exit at the exact TP/stop with zero costs. To make their
+    pnl_pct directly comparable to realized trades' pnl_pct, subtract
+    2x fee_rate_bps + 2x slippage_bps. Calibrated empirically in the Phase 1.7
+    cost study (≈0.20 pct-pts under current settings: 2*6 + 2*4 = 20 bps).
+    Returns 0.0 when shadow_replay_fee_aware is False (legacy gross behavior).
+    """
+    s = get_settings()
+    if not s.shadow_replay_fee_aware:
+        return 0.0
+    return (2.0 * float(s.fee_rate_bps) + 2.0 * float(s.slippage_bps)) / 100.0
 
 
 def evaluate_signal_follow_up(
@@ -167,17 +183,19 @@ def _planned_shadow_follow_up(
     direction = signal.direction
     max_favorable, max_adverse = _favorable_adverse_pct(direction, entry, candles)
 
+    cost_pct = _shadow_cost_pct()
     for candle in candles:
         stop_hit = _stop_hit(direction, stop, candle)
         target_hit = _target_hit(direction, target, candle)
         if stop_hit and target_hit:
-            pnl_pct = _directional_pnl_pct(direction, entry, stop)
+            gross = _directional_pnl_pct(direction, entry, stop)
             return _result(
                 status="would_lose",
                 verdict=_decision_verdict(decision_accepted, "negative", closed=True),
                 basis="planned_shadow",
                 summary="Stop and target touched in the same candle; counted as stop first for conservative review.",
-                pnl_pct=pnl_pct,
+                pnl_pct=gross - cost_pct,
+                pnl_pct_gross=gross,
                 max_favorable_pct=max_favorable,
                 max_adverse_pct=max_adverse,
                 exit_reason="stop_loss_conservative",
@@ -188,13 +206,14 @@ def _planned_shadow_follow_up(
                 settled=True,
             )
         if stop_hit:
-            pnl_pct = _directional_pnl_pct(direction, entry, stop)
+            gross = _directional_pnl_pct(direction, entry, stop)
             return _result(
                 status="would_lose",
                 verdict=_decision_verdict(decision_accepted, "negative", closed=True),
                 basis="planned_shadow",
                 summary="Shadow trade would have hit stop loss.",
-                pnl_pct=pnl_pct,
+                pnl_pct=gross - cost_pct,
+                pnl_pct_gross=gross,
                 max_favorable_pct=max_favorable,
                 max_adverse_pct=max_adverse,
                 exit_reason="stop_loss",
@@ -205,13 +224,14 @@ def _planned_shadow_follow_up(
                 settled=True,
             )
         if target_hit:
-            pnl_pct = _directional_pnl_pct(direction, entry, target)
+            gross = _directional_pnl_pct(direction, entry, target)
             return _result(
                 status="would_win",
                 verdict=_decision_verdict(decision_accepted, "positive", closed=True),
                 basis="planned_shadow",
                 summary="Shadow trade would have reached the first take-profit.",
-                pnl_pct=pnl_pct,
+                pnl_pct=gross - cost_pct,
+                pnl_pct_gross=gross,
                 max_favorable_pct=max_favorable,
                 max_adverse_pct=max_adverse,
                 exit_reason="take_profit_1",
@@ -251,7 +271,9 @@ def _directional_shadow_follow_up(
 ) -> dict[str, Any]:
     entry = float(signal.entry_price)
     last_close = float(candles[-1].close)
-    pnl_pct = _directional_pnl_pct(signal.direction, entry, last_close)
+    gross = _directional_pnl_pct(signal.direction, entry, last_close)
+    cost_pct = _shadow_cost_pct()
+    pnl_pct = gross - cost_pct
     max_favorable, max_adverse = _favorable_adverse_pct(signal.direction, entry, candles)
     if pnl_pct >= min_move_pct:
         polarity = "positive"
@@ -270,6 +292,7 @@ def _directional_shadow_follow_up(
         basis=basis,
         summary=summary,
         pnl_pct=pnl_pct,
+        pnl_pct_gross=gross,
         max_favorable_pct=max_favorable,
         max_adverse_pct=max_adverse,
         exit_reason="mark_to_latest_candle",
@@ -375,6 +398,7 @@ def _result(
     horizon_minutes: int,
     settled: bool,
     pnl_pct: float | None = None,
+    pnl_pct_gross: float | None = None,
     max_favorable_pct: float | None = None,
     max_adverse_pct: float | None = None,
     exit_reason: str | None = None,
@@ -385,7 +409,11 @@ def _result(
         "verdict": verdict,
         "basis": basis,
         "summary": summary,
+        # Phase 2B Branch 1: pnl_pct is net (fee+slippage adjusted) when
+        # shadow_replay_fee_aware=True; pnl_pct_gross preserves the original
+        # cost-free value for transparency / audit.
         "pnl_pct": None if pnl_pct is None else round(float(pnl_pct), 4),
+        "pnl_pct_gross": None if pnl_pct_gross is None else round(float(pnl_pct_gross), 4),
         "max_favorable_pct": max_favorable_pct,
         "max_adverse_pct": max_adverse_pct,
         "exit_reason": exit_reason,
