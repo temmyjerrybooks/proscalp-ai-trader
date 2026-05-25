@@ -1007,12 +1007,30 @@ class BotRunner:
             if price <= 0:
                 continue
             trade.unrealized_pnl = self._unrealized_pnl(trade, price)
+            self._update_mfe_mae(trade, trade.unrealized_pnl)
             await self._maybe_move_break_even(trade, price)
             close_reason = self._close_reason(trade, price)
             if close_reason:
                 await self._close_trade(db, adapter, trade, price, close_reason)
                 continue
             await self._maybe_partial_exit(db, adapter, trade, price)
+
+    def _update_mfe_mae(self, trade: Trade, current_pnl: float) -> None:
+        """Phase 2B Branch 1: track per-trade max favorable / adverse excursion.
+
+        Stored in trade.extra so no schema migration. The polling loop calls
+        this at most once per cycle (~10s); resolution is coarse but adequate
+        for the next round of analysis. MFE >= 0, MAE <= 0 by construction.
+        """
+        if not self.settings.mfe_mae_logging_enabled:
+            return
+        extra = dict(trade.extra or {})
+        prev_mfe = float(extra.get("mfe_pnl") or 0.0)
+        prev_mae = float(extra.get("mae_pnl") or 0.0)
+        extra["mfe_pnl"] = max(prev_mfe, float(current_pnl))
+        extra["mae_pnl"] = min(prev_mae, float(current_pnl))
+        extra["mfe_mae_updated_at"] = utc_now().isoformat()
+        trade.extra = extra
 
     async def _sync_exchange_resting_trades(
         self, db: AsyncSession, adapter: ExchangeAdapter, trades: list[Trade]
@@ -1031,9 +1049,15 @@ class BotRunner:
             logger.warning("sync_resting_fetch_positions_failed", error=str(exc))
             return
         open_symbols = {p.symbol for p in positions}
+        positions_by_symbol = {p.symbol: p for p in positions}
         for trade in trades:
             if trade.symbol in open_symbols:
-                continue  # still open; MFE/MAE tracking handled elsewhere
+                # Still open — update unrealized PnL + MFE/MAE from the exchange's view.
+                position = positions_by_symbol.get(trade.symbol)
+                if position is not None:
+                    trade.unrealized_pnl = float(position.unrealized_pnl)
+                    self._update_mfe_mae(trade, trade.unrealized_pnl)
+                continue
             extra = dict(trade.extra or {})
             stop_id = extra.get("stop_order_id")
             tp_id = extra.get("take_profit_order_id")
