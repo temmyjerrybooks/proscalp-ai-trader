@@ -185,30 +185,53 @@ class BinanceAdapter(ExchangeAdapter):
         ]
 
     async def place_order(self, request: OrderRequest) -> OrderResult:
-        quantity = request.quantity
-        price = request.price
         rules = await self.fetch_symbol_rules(request.symbol)
-        quantity = self._round_quantity(quantity, rules, request.order_type)
+        is_protective = request.order_type in ("stop_market", "take_profit_market")
+        is_whole_position = is_protective and request.close_position
+
+        quantity = request.quantity
+        if not is_whole_position:
+            quantity = self._round_quantity(quantity, rules, request.order_type)
+            if quantity < rules["min_qty"]:
+                raise ValueError(
+                    f"{request.symbol} quantity is below minimum after exchange rounding"
+                )
+
+        price = request.price
         if request.order_type == "limit" and price is not None:
             price = self._round_price(price, rules, up=False)
             if quantity * price < rules["min_notional"]:
-                raise ValueError(f"{request.symbol} order notional is below minimum after exchange rounding")
-        if quantity < rules["min_qty"]:
-            raise ValueError(f"{request.symbol} quantity is below minimum after exchange rounding")
+                raise ValueError(
+                    f"{request.symbol} order notional is below minimum after exchange rounding"
+                )
+
+        stop_price = request.stop_price
+        if is_protective:
+            if stop_price is None:
+                raise ValueError(f"{request.order_type} requires stop_price")
+            stop_price = self._round_price(stop_price, rules, up=False)
 
         order_type = request.order_type.upper()
         params: dict[str, Any] = {
             "symbol": request.symbol,
             "side": request.side.upper(),
             "type": order_type,
-            "quantity": self._format_quantity(quantity, int(rules["quantity_precision"])),
             "newClientOrderId": request.client_order_id,
             "newOrderRespType": "RESULT",
         }
+        if not is_whole_position:
+            params["quantity"] = self._format_quantity(quantity, int(rules["quantity_precision"]))
         if request.order_type == "limit":
             params["price"] = self._format_price(price or 0, int(rules["price_precision"]))
             params["timeInForce"] = request.time_in_force or "GTC"
-        if self.futures and request.reduce_only:
+        if is_protective:
+            params["stopPrice"] = self._format_price(stop_price, int(rules["price_precision"]))
+            if request.close_position:
+                params["closePosition"] = "true"
+            if request.working_type:
+                params["workingType"] = request.working_type
+        # Binance rejects reduceOnly + closePosition together; closePosition already implies it.
+        if self.futures and request.reduce_only and not request.close_position:
             params["reduceOnly"] = "true"
         params = {key: value for key, value in params.items() if value is not None}
         path = "/fapi/v1/order" if self.futures else "/api/v3/order"
