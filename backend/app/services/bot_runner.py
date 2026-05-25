@@ -914,39 +914,78 @@ class BotRunner:
         for position in positions:
             if position.symbol in open_symbols or position.symbol in pending_symbols:
                 continue
-            stop_pct = 0.0035
-            target_pct = [0.003, 0.005, 0.008]
+            # Phase 2B Branch 1: stop/TP defaults moved to settings (clarification A).
+            stop_pct = self.settings.orphan_reconcile_stop_pct
+            target_pct = list(self.settings.orphan_reconcile_tp_levels)
             if position.side == "long":
                 stop_loss = position.entry_price * (1 - stop_pct)
                 take_profit = [position.entry_price * (1 + pct) for pct in target_pct]
             else:
                 stop_loss = position.entry_price * (1 + stop_pct)
                 take_profit = [position.entry_price * (1 - pct) for pct in target_pct]
-            db.add(
-                Trade(
-                    symbol=position.symbol,
-                    side=position.side,
-                    exchange=self.settings.exchange.value,
-                    mode=self.settings.trading_mode.value,
+            take_profit_rounded = [round(price, 8) for price in take_profit]
+            orphan_trade = Trade(
+                symbol=position.symbol,
+                side=position.side,
+                exchange=self.settings.exchange.value,
+                mode=self.settings.trading_mode.value,
+                setup_name="Exchange reconciled position",
+                entry_price=position.entry_price,
+                stop_loss=round(stop_loss, 8),
+                take_profit={"levels": take_profit_rounded},
+                quantity=position.quantity,
+                status="open",
+                unrealized_pnl=position.unrealized_pnl,
+                extra={
+                    "reconciled_orphan_position": True,
+                    "entry_session": "unknown",
+                    "entry_regime": "unknown",
+                    "original_quantity": position.quantity,
+                    "remaining_quantity": position.quantity,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "break_even_moved": False,
+                },
+            )
+            db.add(orphan_trade)
+            await db.flush()
+
+            # Per clarification A: when exchange-resting exits are ON, orphans
+            # also get protective orders attached (so they participate in the
+            # same exit path as regular entries).
+            if self._use_exchange_resting_exits():
+                from app.execution.order_manager import OrderManager
+                from app.strategies.base_strategy import StrategySignal
+                adapter_for_attach = create_exchange_adapter(self.settings)
+                manager = OrderManager(
+                    adapter_for_attach, risk_engine=self.risk_engine,
+                    paper=self.paper, settings=self.settings,
+                )
+                synthetic_signal = StrategySignal(
                     setup_name="Exchange reconciled position",
+                    symbol=position.symbol,
+                    direction=position.side,
                     entry_price=position.entry_price,
                     stop_loss=round(stop_loss, 8),
-                    take_profit={"levels": [round(price, 8) for price in take_profit]},
-                    quantity=position.quantity,
-                    status="open",
-                    unrealized_pnl=position.unrealized_pnl,
-                    extra={
-                        "reconciled_orphan_position": True,
-                        "entry_session": "unknown",
-                        "entry_regime": "unknown",
-                        "original_quantity": position.quantity,
-                        "remaining_quantity": position.quantity,
-                        "tp1_hit": False,
-                        "tp2_hit": False,
-                        "break_even_moved": False,
-                    },
+                    take_profit_levels=take_profit_rounded,
+                    trailing_stop=0.0,
+                    expected_move=0.0,
+                    risk_reward_ratio=0.0,
+                    confidence_score=0.0,
+                    accepted=True,
                 )
-            )
+                protective = await manager.attach_protective_orders(synthetic_signal, orphan_trade.id)
+                extra = dict(orphan_trade.extra or {})
+                extra["protective_orders_attached_ms"] = round(protective.elapsed_ms, 1)
+                if protective.success:
+                    extra["exchange_resting_active"] = True
+                    extra["stop_order_id"] = protective.stop_order_id
+                    extra["take_profit_order_id"] = protective.take_profit_order_id
+                else:
+                    extra["exchange_resting_active"] = False
+                    extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
+                orphan_trade.extra = extra
+
             await self._risk_event(
                 db,
                 "warning",
