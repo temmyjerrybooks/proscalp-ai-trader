@@ -904,6 +904,15 @@ class BotRunner:
             and self.settings.trading_mode != TradingMode.PAPER
         )
 
+    def _use_paper_sim_wiring(self) -> bool:
+        """Phase 2B Branch 1: in paper mode, route exits through the simulator
+        instead of the mid-price polling logic. Eliminates the split-brain
+        where the simulator's equity never moved on closes (only fees)."""
+        return (
+            self.settings.paper_sim_wired_to_live_loop
+            and self.settings.trading_mode == TradingMode.PAPER
+        )
+
     async def _persist_execution(
         self,
         db: AsyncSession,
@@ -984,19 +993,27 @@ class BotRunner:
         trades = await self._open_database_trades(db)
         self.status.open_trade_count = len(trades)
 
-        # Phase 2B Branch 1: split trades by whether they have exchange-resting protective
-        # orders. Resting trades are synced from the exchange (positions disappear -> close).
-        # Legacy trades use the original mid-price polling logic.
+        # Phase 2B Branch 1: split trades across three exit paths.
+        #   - resting:   exchange-resting protective orders (live/testnet futures)
+        #   - paper_sim: paper simulator authoritative (paper mode + flag ON)
+        #   - legacy:    original mid-price polling
+        use_resting = self._use_exchange_resting_exits()
+        use_paper_sim = self._use_paper_sim_wiring()
         resting_trades: list[Trade] = []
+        paper_sim_trades: list[Trade] = []
         legacy_trades: list[Trade] = []
         for t in trades:
-            if (t.extra or {}).get("exchange_resting_active"):
+            if use_resting and (t.extra or {}).get("exchange_resting_active"):
                 resting_trades.append(t)
+            elif use_paper_sim:
+                paper_sim_trades.append(t)
             else:
                 legacy_trades.append(t)
 
-        if resting_trades and self._use_exchange_resting_exits():
+        if resting_trades:
             await self._sync_exchange_resting_trades(db, adapter, resting_trades)
+        if paper_sim_trades:
+            await self._sync_paper_simulator_trades(db, adapter, paper_sim_trades)
 
         for trade in legacy_trades:
             try:
@@ -1070,6 +1087,59 @@ class BotRunner:
                     fill_price = trade.entry_price
             close_reason = reason or "exchange_resting_close"
             await self._finalize_trade_close(db, trade, fill_price, close_reason)
+
+    async def _sync_paper_simulator_trades(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trades: list[Trade]
+    ) -> None:
+        """Phase 2B Branch 1: paper-mode exits driven by PaperTradingSimulator.
+
+        For each trade, fetch the current mid price, call paper.update_price,
+        and translate any returned PaperFills into DB Trade row updates.
+        Trade.id == PaperPosition.id (set in _persist_execution) so the
+        mapping is direct. Eliminates the split-brain where the simulator's
+        equity tracked only fees, not realized PnL.
+        """
+        for trade in trades:
+            try:
+                book = await adapter.fetch_order_book(trade.symbol, limit=20)
+                price = book.mid_price
+            except Exception:
+                continue
+            if price <= 0:
+                continue
+            trade.unrealized_pnl = self._unrealized_pnl(trade, price)
+            self._update_mfe_mae(trade, trade.unrealized_pnl)
+
+            fills = self.paper.update_price(trade.symbol, price)
+            for fill in fills:
+                if fill.trade_id != trade.id:
+                    continue
+                extra = dict(trade.extra or {})
+                trade.realized_pnl = float(trade.realized_pnl or 0.0) + float(fill.pnl)
+                trade.fees = float(trade.fees or 0.0) + float(fill.fee)
+                if fill.reason == "stop_loss":
+                    trade.quantity = 0.0
+                    trade.unrealized_pnl = 0.0
+                    trade.status = "closed"
+                    trade.closed_at = utc_now()
+                    extra["close_reason"] = "stop_loss"
+                    extra["remaining_quantity"] = 0.0
+                    trade.extra = extra
+                    self._record_closed_trade_outcome(trade)
+                elif fill.reason == "trailing_runner_target":
+                    trade.quantity = 0.0
+                    trade.unrealized_pnl = 0.0
+                    trade.status = "closed"
+                    trade.closed_at = utc_now()
+                    extra["close_reason"] = "final_take_profit"
+                    extra["remaining_quantity"] = 0.0
+                    trade.extra = extra
+                    self._record_closed_trade_outcome(trade)
+                elif fill.reason in ("tp1", "tp2"):
+                    trade.quantity = max(0.0, float(trade.quantity) - float(fill.quantity))
+                    extra[f"{fill.reason}_hit"] = True
+                    extra["remaining_quantity"] = trade.quantity
+                    trade.extra = extra
 
     async def _attribute_exchange_close(
         self, adapter: ExchangeAdapter, symbol: str, stop_id: str | None, tp_id: str | None
