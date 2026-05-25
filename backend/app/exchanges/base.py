@@ -186,6 +186,15 @@ class ExchangeAdapter(ABC):
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         raise NotImplementedError
 
+    async def fetch_order(self, symbol: str, order_id: str) -> OrderResult:
+        """Query a specific order by id (e.g. to attribute the fill of a closed protective order).
+
+        Phase 2B Branch 1: optional capability. Default raises; adapters that
+        support it (Binance) override. Sync logic that needs precise close
+        attribution should handle NotImplementedError as a degraded path.
+        """
+        raise NotImplementedError(f"{self.name} adapter does not implement fetch_order")
+
     async def get_fees(self, symbol: str) -> dict[str, float]:
         return {"maker_bps": 2.0, "taker_bps": 6.0}
 

@@ -645,7 +645,7 @@ class BotRunner:
 
         manager = OrderManager(adapter, risk_engine=self.risk_engine, paper=self.paper, settings=self.settings)
         report = await manager.execute_signal(signal, permission, position_size.quantity)
-        await self._persist_execution(
+        trade = await self._persist_execution(
             db,
             scored,
             report=report,
@@ -655,6 +655,35 @@ class BotRunner:
             session=session,
             regime=regime,
         )
+
+        # Phase 2B Branch 1: attach exchange-resting protective orders for live/testnet futures
+        # entries that filled. Failure falls back to legacy mid-price polling (logged loudly).
+        if (
+            report.accepted
+            and trade is not None
+            and trade.status == "open"
+            and self._use_exchange_resting_exits()
+            and report.order_result is not None
+        ):
+            protective = await manager.attach_protective_orders(signal, trade.id)
+            extra = dict(trade.extra or {})
+            extra["protective_orders_attached_ms"] = round(protective.elapsed_ms, 1)
+            if protective.success:
+                extra["exchange_resting_active"] = True
+                extra["stop_order_id"] = protective.stop_order_id
+                extra["take_profit_order_id"] = protective.take_profit_order_id
+            else:
+                extra["exchange_resting_active"] = False
+                extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
+                await self._risk_event(
+                    db, "warning", "protective_orders_failed",
+                    "; ".join(protective.reasons) or "attach_protective_orders failed",
+                    {"trade_id": trade.id, "symbol": signal.symbol,
+                     "stop_order_id": protective.stop_order_id,
+                     "take_profit_order_id": protective.take_profit_order_id},
+                )
+            trade.extra = extra
+
         if not report.accepted:
             await self._risk_event(
                 db,
@@ -680,6 +709,18 @@ class BotRunner:
         )
         return True
 
+    def _use_exchange_resting_exits(self) -> bool:
+        """Phase 2B Branch 1: are exchange-resting protective orders active?
+
+        Requires the feature flag, futures market type, and a non-paper mode
+        (testnet or live). Paper mode keeps the simulator authoritative.
+        """
+        return (
+            self.settings.exchange_resting_exits_enabled
+            and self.settings.is_futures_mode
+            and self.settings.trading_mode != TradingMode.PAPER
+        )
+
     async def _persist_execution(
         self,
         db: AsyncSession,
@@ -690,7 +731,7 @@ class BotRunner:
         position_size,
         session: SessionState,
         regime: RegimeResult,
-    ) -> None:
+    ) -> Trade | None:
         signal = scored.signal
         trade: Trade | None = None
         if report.accepted and (report.paper_position or report.order_result):
@@ -754,11 +795,27 @@ class BotRunner:
                     raw_response=report.order_result.raw,
                 )
             )
+        return trade
 
     async def _manage_open_trades(self, db: AsyncSession, adapter: ExchangeAdapter) -> None:
         trades = await self._open_database_trades(db)
         self.status.open_trade_count = len(trades)
-        for trade in trades:
+
+        # Phase 2B Branch 1: split trades by whether they have exchange-resting protective
+        # orders. Resting trades are synced from the exchange (positions disappear -> close).
+        # Legacy trades use the original mid-price polling logic.
+        resting_trades: list[Trade] = []
+        legacy_trades: list[Trade] = []
+        for t in trades:
+            if (t.extra or {}).get("exchange_resting_active"):
+                resting_trades.append(t)
+            else:
+                legacy_trades.append(t)
+
+        if resting_trades and self._use_exchange_resting_exits():
+            await self._sync_exchange_resting_trades(db, adapter, resting_trades)
+
+        for trade in legacy_trades:
             try:
                 book = await adapter.fetch_order_book(trade.symbol, limit=20)
                 price = book.mid_price
@@ -773,6 +830,60 @@ class BotRunner:
                 await self._close_trade(db, adapter, trade, price, close_reason)
                 continue
             await self._maybe_partial_exit(db, adapter, trade, price)
+
+    async def _sync_exchange_resting_trades(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trades: list[Trade]
+    ) -> None:
+        """Phase 2B Branch 1: for trades with exchange-resting protective orders,
+        detect position closure on the exchange and finalize the DB Trade row.
+
+        Sync logic:
+          - position still present on the exchange -> nothing to do (still open)
+          - position gone -> trade was closed by stop or TP (or external action).
+            Query both order ids to attribute the close (fill_price + reason).
+        """
+        try:
+            positions = await adapter.fetch_positions()
+        except Exception as exc:
+            logger.warning("sync_resting_fetch_positions_failed", error=str(exc))
+            return
+        open_symbols = {p.symbol for p in positions}
+        for trade in trades:
+            if trade.symbol in open_symbols:
+                continue  # still open; MFE/MAE tracking handled elsewhere
+            extra = dict(trade.extra or {})
+            stop_id = extra.get("stop_order_id")
+            tp_id = extra.get("take_profit_order_id")
+            fill_price, reason = await self._attribute_exchange_close(adapter, trade.symbol, stop_id, tp_id)
+            if fill_price <= 0:
+                try:
+                    book = await adapter.fetch_order_book(trade.symbol, limit=20)
+                    fill_price = book.mid_price
+                except Exception:
+                    fill_price = trade.entry_price
+            close_reason = reason or "exchange_resting_close"
+            await self._finalize_trade_close(db, trade, fill_price, close_reason)
+
+    async def _attribute_exchange_close(
+        self, adapter: ExchangeAdapter, symbol: str, stop_id: str | None, tp_id: str | None
+    ) -> tuple[float, str]:
+        """Query stop and TP orders; return (fill_price, close_reason).
+
+        Returns (0.0, '') if neither order can be attributed (caller falls back
+        to mark price + a generic close reason).
+        """
+        for order_id, reason in ((stop_id, "stop_loss_exchange"), (tp_id, "take_profit_exchange")):
+            if not order_id:
+                continue
+            try:
+                order = await adapter.fetch_order(symbol, order_id)
+            except NotImplementedError:
+                return 0.0, ""
+            except Exception:
+                continue
+            if order.status.lower() == "filled" and (order.average_price or 0) > 0:
+                return float(order.average_price), reason
+        return 0.0, ""
 
     async def _reconcile_pending_and_orphan_positions(self, db: AsyncSession, positions, open_orders) -> None:
         if self.settings.trading_mode == TradingMode.PAPER:

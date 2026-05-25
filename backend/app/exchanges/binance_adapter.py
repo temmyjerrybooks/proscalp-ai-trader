@@ -262,6 +262,21 @@ class BinanceAdapter(ExchangeAdapter):
             raw=raw,
         )
 
+    async def fetch_order(self, symbol: str, order_id: str) -> OrderResult:
+        path = "/fapi/v1/order" if self.futures else "/api/v3/order"
+        raw = await self._signed_request("GET", path, params={"symbol": symbol, "orderId": order_id})
+        return OrderResult(
+            order_id=str(raw.get("orderId", order_id)),
+            symbol=raw.get("symbol", symbol),
+            status=str(raw.get("status", "unknown")).lower(),
+            side=str(raw.get("side", "BUY")).lower(),  # type: ignore[arg-type]
+            order_type=str(raw.get("type", "LIMIT")).lower(),  # type: ignore[arg-type]
+            quantity=float(raw.get("origQty") or 0),
+            filled_quantity=float(raw.get("executedQty") or 0),
+            average_price=float(raw.get("avgPrice") or 0) or None,
+            raw=raw,
+        )
+
     async def fetch_open_orders(self, symbol: str | None = None) -> list[OrderResult]:
         path = "/fapi/v1/openOrders" if self.futures else "/api/v3/openOrders"
         params = {"symbol": symbol} if symbol else {}
