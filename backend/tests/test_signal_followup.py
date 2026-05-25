@@ -147,3 +147,63 @@ def test_missing_followup_market_data_stops_waiting_after_grace_period() -> None
     assert result["status"] == "market_data_unavailable"
     assert result["verdict"] == "unknown"
     assert result["settled"] is False
+
+
+# ---- Phase 2B Branch 1: fee-aware shadow replay ----
+
+def test_shadow_take_profit_pnl_is_fee_adjusted_with_gross_preserved() -> None:
+    """Default settings: fee_rate_bps=6, slippage_bps=4 -> round-trip 0.20 pct-pts.
+    A long entry @100 with target @102 = gross +2.0%; net should be ~+1.80%."""
+    result = evaluate_signal_follow_up(
+        _signal(accepted=False, target=102.0),
+        None,
+        [_candle(1, high=102.5, low=100.1, close=102.1)],
+        decision_accepted=False,
+        now=BASE_TIME + timedelta(minutes=5),
+    )
+    assert result["pnl_pct_gross"] == pytest.approx(2.0, abs=1e-3)
+    assert result["pnl_pct"] == pytest.approx(1.80, abs=1e-3)
+
+
+def test_shadow_stop_loss_pnl_is_fee_adjusted_negative() -> None:
+    """Long stop @99 = gross -1.0%; net ~-1.20% after costs."""
+    result = evaluate_signal_follow_up(
+        _signal(accepted=False),
+        None,
+        [_candle(1, high=100.2, low=98.8, close=99.1)],
+        decision_accepted=False,
+        now=BASE_TIME + timedelta(minutes=5),
+    )
+    assert result["pnl_pct_gross"] == pytest.approx(-1.0, abs=1e-3)
+    assert result["pnl_pct"] == pytest.approx(-1.20, abs=1e-3)
+
+
+def test_shadow_fee_adjustment_can_be_disabled() -> None:
+    """When shadow_replay_fee_aware=False, pnl_pct == pnl_pct_gross."""
+    # get_settings is lru_cached; clear so override takes effect.
+    from app.config.settings import get_settings, Settings
+    get_settings.cache_clear()
+    try:
+        get_settings.__wrapped__ = lambda: Settings(shadow_replay_fee_aware=False)  # type: ignore[attr-defined]
+        import app.signals.followup as fu
+        # easier: patch the module-level get_settings
+        original = fu.get_settings
+        fu.get_settings = lambda: Settings(shadow_replay_fee_aware=False)
+        try:
+            result = evaluate_signal_follow_up(
+                _signal(accepted=False, target=102.0),
+                None,
+                [_candle(1, high=102.5, low=100.1, close=102.1)],
+                decision_accepted=False,
+                now=BASE_TIME + timedelta(minutes=5),
+            )
+            assert result["pnl_pct"] == result["pnl_pct_gross"]
+            assert result["pnl_pct"] == pytest.approx(2.0, abs=1e-3)
+        finally:
+            fu.get_settings = original
+    finally:
+        get_settings.cache_clear()
+
+
+# Import pytest at the bottom so the helper-only file at the top stays clean.
+import pytest  # noqa: E402
