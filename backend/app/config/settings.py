@@ -190,6 +190,12 @@ class Settings(BaseSettings):
     # Max acceptable elapsed time for protective-order attachment after entry fill.
     # Exceeding this logs a `protective_order_slow` warning (per Branch 1 clarification B).
     protective_order_max_elapsed_ms: int = 2000
+    # Phase 2B Branch 1 — circuit-breaker on protective-order failure cascade.
+    # If attach_protective_orders fails >= threshold times in any rolling window,
+    # auto-disable exchange_resting_exits_enabled in-memory for the rest of the UTC day.
+    # Auto-resets at next UTC day-start. Will fire only when the flag is ON (Branch 2).
+    protective_orders_failure_threshold: int = 3
+    protective_orders_failure_window_hours: int = 1
 
     @field_validator("max_concurrent_trades")
     @classmethod

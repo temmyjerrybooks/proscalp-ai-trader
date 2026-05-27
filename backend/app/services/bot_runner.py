@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import re
 import time as _time
+from collections import deque
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from uuid import uuid4
 
 import structlog
@@ -131,6 +132,9 @@ class BotRunner:
         self._loss_cooldown_since: datetime | None = None
         self._pending_signal_ids: list[str] = []
         self._last_signal_ids: list[str] = []
+        # Phase 2B Branch 1 refinement 2 — protective-orders failure circuit-breaker.
+        self._protective_failures: deque[datetime] = deque()
+        self._resting_disabled_until_utc_day: date | None = None
 
     def current_signal_ids(self) -> list[str]:
         """Return the exact signal IDs from the last committed scan batch."""
@@ -266,6 +270,10 @@ class BotRunner:
                     trade_id=trade.id, symbol=trade.symbol, reasons=protective.reasons,
                 )
             trade.extra = new_extra
+            await self._record_protective_attach_outcome(
+                db, protective.success,
+                context={"trade_id": trade.id, "symbol": trade.symbol, "source": "startup_repair"},
+            )
 
         # State 3: orphan protective orders on the exchange with no DB counterpart.
         for symbol, orders in protective_by_symbol.items():
@@ -866,6 +874,10 @@ class BotRunner:
                      "take_profit_order_id": protective.take_profit_order_id},
                 )
             trade.extra = extra
+            await self._record_protective_attach_outcome(
+                db, protective.success,
+                context={"trade_id": trade.id, "symbol": signal.symbol, "source": "entry_attach"},
+            )
 
         if not report.accepted:
             await self._risk_event(
@@ -897,12 +909,70 @@ class BotRunner:
 
         Requires the feature flag, futures market type, and a non-paper mode
         (testnet or live). Paper mode keeps the simulator authoritative.
+
+        Circuit-breaker (refinement 2): if attach_protective_orders has failed
+        >= protective_orders_failure_threshold times in the rolling
+        protective_orders_failure_window_hours window, returns False for the
+        rest of the UTC day, auto-resetting at the next UTC day-start.
         """
-        return (
+        if not (
             self.settings.exchange_resting_exits_enabled
             and self.settings.is_futures_mode
             and self.settings.trading_mode != TradingMode.PAPER
+        ):
+            return False
+        today = datetime.now(timezone.utc).date()
+        if self._resting_disabled_until_utc_day is None:
+            return True
+        if self._resting_disabled_until_utc_day == today:
+            return False  # circuit-breaker tripped today
+        # Past trip date is < today -> auto-reset.
+        self._resting_disabled_until_utc_day = None
+        return True
+
+    async def _record_protective_attach_outcome(
+        self, db: AsyncSession, success: bool, *, context: dict | None = None
+    ) -> bool:
+        """Record an attach_protective_orders outcome. Trips the circuit-breaker
+        when failures within the rolling window meet the threshold.
+
+        Returns True if this call tripped the breaker (so callers can dedupe alerts).
+        """
+        if success:
+            return False
+        now = datetime.now(timezone.utc)
+        self._protective_failures.append(now)
+        cutoff = now - timedelta(hours=max(1, self.settings.protective_orders_failure_window_hours))
+        while self._protective_failures and self._protective_failures[0] < cutoff:
+            self._protective_failures.popleft()
+        if len(self._protective_failures) < self.settings.protective_orders_failure_threshold:
+            return False
+        # Trip the breaker.
+        self._resting_disabled_until_utc_day = now.date()
+        self._protective_failures.clear()
+        message = (
+            f"protective_orders circuit-breaker tripped: "
+            f"{self.settings.protective_orders_failure_threshold} failures within "
+            f"{self.settings.protective_orders_failure_window_hours}h; "
+            f"exchange-resting exits auto-disabled until UTC midnight"
         )
+        await self._risk_event(
+            db, "warning", "protective_orders_circuit_breaker", message,
+            {**(context or {}),
+             "threshold": self.settings.protective_orders_failure_threshold,
+             "window_hours": self.settings.protective_orders_failure_window_hours,
+             "tripped_at_utc": now.isoformat()},
+        )
+        try:
+            await self.alerts.send("protective_orders_circuit_breaker", message)
+        except Exception as exc:  # pragma: no cover - alerting is best-effort
+            logger.warning("circuit_breaker_alert_failed", error=str(exc))
+        logger.warning(
+            "protective_orders_circuit_breaker_tripped",
+            threshold=self.settings.protective_orders_failure_threshold,
+            window_hours=self.settings.protective_orders_failure_window_hours,
+        )
+        return True
 
     def _use_paper_sim_wiring(self) -> bool:
         """Phase 2B Branch 1: in paper mode, route exits through the simulator
@@ -1262,6 +1332,10 @@ class BotRunner:
                     extra["exchange_resting_active"] = False
                     extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
                 orphan_trade.extra = extra
+                await self._record_protective_attach_outcome(
+                    db, protective.success,
+                    context={"trade_id": orphan_trade.id, "symbol": position.symbol, "source": "orphan_reconcile"},
+                )
 
             await self._risk_event(
                 db,

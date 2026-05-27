@@ -60,6 +60,7 @@ Foundation work (items 1–4 + clarifications) merged-ready but awaiting staging
 - `startup_adapter_test_enabled = True` — places + immediately cancels a far-from-market `STOP_MARKET` on BTCUSDT to validate the adapter wiring before the main loop starts. Failure logs loudly but does not block startup.
 - `orphan_reconcile_stop_pct = 0.0035`, `orphan_reconcile_tp_levels = [0.003, 0.005, 0.008]` — formerly hardcoded in `_reconcile_pending_and_orphan_positions`, now settings (Branch 1 clarification A). Orphans receive protective orders when resting is ON.
 - `protective_order_max_elapsed_ms = 2000` — `OrderManager.attach_protective_orders` is **sequential** (stop first, then TP) and warns via `protective_order_slow` when total elapsed exceeds this.
+- **Circuit-breaker (refinement 2):** `protective_orders_failure_threshold = 3`, `protective_orders_failure_window_hours = 1`. If `attach_protective_orders` fails >= threshold times in any rolling window, `_use_exchange_resting_exits()` returns False for the rest of the UTC day (auto-resets at next UTC day-start). Emits a `protective_orders_circuit_breaker` RiskEvent + Telegram alert. Tracker state lives on the BotRunner singleton (`_protective_failures` deque, `_resting_disabled_until_utc_day` date). Branch 1 leaves the resting flag OFF, so this code path won't fire in production until Branch 2 — but the safety net is in place.
 
 `PositionManager` (`execution/position_manager.py`) is still dead code; Branch 2 decision pending.
 
