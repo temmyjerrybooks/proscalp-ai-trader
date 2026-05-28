@@ -8,8 +8,13 @@ from typing import Any, Literal
 
 Side = Literal["buy", "sell"]
 Direction = Literal["long", "short"]
-OrderType = Literal["market", "limit"]
+# Phase 2B: stop_market / take_profit_market are exchange-resting protective orders
+# (Binance Futures STOP_MARKET / TAKE_PROFIT_MARKET).
+OrderType = Literal["market", "limit", "stop_market", "take_profit_market"]
 TimeInForce = Literal["GTC", "IOC", "FOK", "GTX"]
+# Binance Futures workingType: CONTRACT_PRICE (last) or MARK_PRICE (mark).
+# MARK_PRICE is generally safer for protective orders (resistant to thin-book wicks).
+WorkingType = Literal["CONTRACT_PRICE", "MARK_PRICE"]
 
 
 @dataclass(slots=True)
@@ -90,11 +95,15 @@ class OrderRequest:
     symbol: str
     side: Side
     order_type: OrderType
-    quantity: float
+    quantity: float = 0.0  # may be 0 when close_position=True (whole-position protective order)
     price: float | None = None
     reduce_only: bool = False
     client_order_id: str | None = None
     time_in_force: TimeInForce | None = None
+    # Phase 2B — for stop_market / take_profit_market:
+    stop_price: float | None = None
+    close_position: bool = False  # Binance Futures: closes the whole position when trigger fires
+    working_type: WorkingType | None = None  # defaults to exchange default (CONTRACT_PRICE) if None
 
 
 @dataclass(slots=True)
@@ -176,6 +185,15 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         raise NotImplementedError
+
+    async def fetch_order(self, symbol: str, order_id: str) -> OrderResult:
+        """Query a specific order by id (e.g. to attribute the fill of a closed protective order).
+
+        Phase 2B Branch 1: optional capability. Default raises; adapters that
+        support it (Binance) override. Sync logic that needs precise close
+        attribution should handle NotImplementedError as a degraded path.
+        """
+        raise NotImplementedError(f"{self.name} adapter does not implement fetch_order")
 
     async def get_fees(self, symbol: str) -> dict[str, float]:
         return {"maker_bps": 2.0, "taker_bps": 6.0}

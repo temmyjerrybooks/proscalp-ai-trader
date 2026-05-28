@@ -174,6 +174,29 @@ class Settings(BaseSettings):
     signal_followup_min_move_pct: float = 0.15
     signal_followup_cache_seconds: int = 30
 
+    # Phase 2B Branch 1 — foundation (exchange-resting exits, measurement, sim wiring).
+    # All trading-impact flags default OFF for gated rollout; measurement-only flags default ON.
+    exchange_resting_exits_enabled: bool = False
+    mfe_mae_logging_enabled: bool = True
+    paper_sim_wired_to_live_loop: bool = False
+    shadow_replay_fee_aware: bool = True
+    startup_reconciliation_enabled: bool = True
+    startup_adapter_test_enabled: bool = True
+    # Orphan reconciliation defaults — formerly hardcoded in bot_runner.
+    # When exchange_resting_exits_enabled is ON, orphan positions also get
+    # protective orders attached using these values.
+    orphan_reconcile_stop_pct: float = 0.0035
+    orphan_reconcile_tp_levels: list[float] = Field(default_factory=lambda: [0.003, 0.005, 0.008])
+    # Max acceptable elapsed time for protective-order attachment after entry fill.
+    # Exceeding this logs a `protective_order_slow` warning (per Branch 1 clarification B).
+    protective_order_max_elapsed_ms: int = 2000
+    # Phase 2B Branch 1 — circuit-breaker on protective-order failure cascade.
+    # If attach_protective_orders fails >= threshold times in any rolling window,
+    # auto-disable exchange_resting_exits_enabled in-memory for the rest of the UTC day.
+    # Auto-resets at next UTC day-start. Will fire only when the flag is ON (Branch 2).
+    protective_orders_failure_threshold: int = 3
+    protective_orders_failure_window_hours: int = 1
+
     @field_validator("max_concurrent_trades")
     @classmethod
     def clamp_concurrency(cls, value: int) -> int:

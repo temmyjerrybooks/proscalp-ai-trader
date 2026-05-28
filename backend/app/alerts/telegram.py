@@ -39,6 +39,7 @@ class TelegramAlertService:
         "session_aggression_mode_activated",
         "session_ended",
         "backtest_completed",
+        "protective_orders_circuit_breaker",
     }
 
     def __init__(self, settings: Settings | None = None) -> None:

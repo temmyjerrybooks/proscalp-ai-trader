@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time as _time
+from collections import deque
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from uuid import uuid4
 
 import structlog
 from sqlalchemy import desc, func, select
@@ -129,6 +132,9 @@ class BotRunner:
         self._loss_cooldown_since: datetime | None = None
         self._pending_signal_ids: list[str] = []
         self._last_signal_ids: list[str] = []
+        # Phase 2B Branch 1 refinement 2 — protective-orders failure circuit-breaker.
+        self._protective_failures: deque[datetime] = deque()
+        self._resting_disabled_until_utc_day: date | None = None
 
     def current_signal_ids(self) -> list[str]:
         """Return the exact signal IDs from the last committed scan batch."""
@@ -158,10 +164,195 @@ class BotRunner:
         self.status.emergency_stopped = False
         self.status.last_error = None
         self._remember("Bot started; autonomous loop armed")
+
+        # Phase 2B Branch 1: startup reconciliation + adapter smoke test.
+        # Wrapped so a failure logs loudly but does not block the main loop —
+        # the loop's per-cycle sync will eventually pick up state divergence.
+        try:
+            await self._run_startup_checks()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("startup_checks_failed", error=str(exc))
+            self._remember(f"Startup checks failed: {exc}")
+
         self._task = asyncio.create_task(self._run_loop(), name="proscalp-autonomous-loop")
         logger.info("bot_started", mode=self.status.mode, exchange=self.status.exchange)
         await self.alerts.send("bot_started", f"ProScalp AI Trader started in {self.status.mode} mode")
         return self.status
+
+    async def _run_startup_checks(self) -> None:
+        """Phase 2B Branch 1: startup reconciliation + adapter smoke test.
+
+        Only runs in non-paper futures mode. Either check is independently
+        gated by its own settings flag.
+        """
+        if self.settings.trading_mode == TradingMode.PAPER or not self.settings.is_futures_mode:
+            return
+        adapter = create_exchange_adapter(self.settings)
+        if self.settings.startup_adapter_test_enabled and self.settings.exchange_resting_exits_enabled:
+            await self._startup_adapter_test(adapter)
+        if self.settings.startup_reconciliation_enabled and self.settings.exchange_resting_exits_enabled:
+            async with AsyncSessionLocal() as db:
+                await self._startup_reconciliation(db, adapter)
+
+    async def _startup_reconciliation(self, db: AsyncSession, adapter: ExchangeAdapter) -> None:
+        """Phase 2B Branch 1 clarification C: 3-state startup reconciliation.
+
+        State 1: DB open trade + matching protective orders -> log 'startup_reconciled'.
+        State 2: DB open trade + no matching protective orders -> attach + 'protective_orders_repaired'.
+        State 3: protective orders on exchange + no DB trade -> cancel + 'orphan_orders_cancelled'.
+        """
+        try:
+            db_trades = await self._open_database_trades(db)
+            exchange_positions = await adapter.fetch_positions()
+            exchange_orders = await adapter.fetch_open_orders()
+        except Exception as exc:
+            logger.error("startup_reconciliation_fetch_failed", error=str(exc))
+            return
+
+        position_symbols = {p.symbol for p in exchange_positions}
+        protective_by_symbol: dict[str, list] = {}
+        for order in exchange_orders:
+            cid = str((order.raw or {}).get("clientOrderId", ""))
+            if cid.startswith("proscalp-sl-") or cid.startswith("proscalp-tp-"):
+                protective_by_symbol.setdefault(order.symbol, []).append(order)
+        db_open_symbols = {t.symbol for t in db_trades}
+
+        reconciled = 0
+        repaired = 0
+        orphan_cancelled = 0
+        manager = OrderManager(adapter, risk_engine=self.risk_engine, paper=self.paper, settings=self.settings)
+
+        for trade in db_trades:
+            if trade.symbol not in position_symbols:
+                continue  # position closed externally; per-cycle sync will finalize
+            existing = protective_by_symbol.get(trade.symbol, [])
+            existing_ids = {o.order_id for o in existing}
+            extra = trade.extra or {}
+            stored = {extra.get("stop_order_id"), extra.get("take_profit_order_id")} - {None, ""}
+            if stored and stored.issubset(existing_ids):
+                reconciled += 1
+                logger.info("startup_reconciled", trade_id=trade.id, symbol=trade.symbol)
+                continue
+            # State 2: missing one or both protective orders -> repair.
+            levels = self._take_profit_levels(trade)
+            synthetic = StrategySignal(
+                setup_name=trade.setup_name,
+                symbol=trade.symbol,
+                direction=trade.side,  # type: ignore[arg-type]
+                entry_price=trade.entry_price,
+                stop_loss=trade.stop_loss,
+                take_profit_levels=levels,
+                trailing_stop=0.0,
+                expected_move=0.0,
+                risk_reward_ratio=0.0,
+                confidence_score=0.0,
+                accepted=True,
+            )
+            protective = await manager.attach_protective_orders(synthetic, trade.id)
+            new_extra = dict(extra)
+            new_extra["protective_orders_attached_ms"] = round(protective.elapsed_ms, 1)
+            if protective.success:
+                new_extra["exchange_resting_active"] = True
+                new_extra["stop_order_id"] = protective.stop_order_id
+                new_extra["take_profit_order_id"] = protective.take_profit_order_id
+                repaired += 1
+                logger.info(
+                    "protective_orders_repaired",
+                    trade_id=trade.id, symbol=trade.symbol,
+                    stop_order_id=protective.stop_order_id,
+                    take_profit_order_id=protective.take_profit_order_id,
+                )
+            else:
+                new_extra["exchange_resting_active"] = False
+                new_extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
+                logger.warning(
+                    "startup_protective_repair_failed",
+                    trade_id=trade.id, symbol=trade.symbol, reasons=protective.reasons,
+                )
+            trade.extra = new_extra
+            await self._record_protective_attach_outcome(
+                db, protective.success,
+                context={"trade_id": trade.id, "symbol": trade.symbol, "source": "startup_repair"},
+            )
+
+        # State 3: orphan protective orders on the exchange with no DB counterpart.
+        for symbol, orders in protective_by_symbol.items():
+            if symbol in db_open_symbols:
+                continue
+            for order in orders:
+                try:
+                    await adapter.cancel_order(symbol, order.order_id)
+                    orphan_cancelled += 1
+                    logger.info(
+                        "orphan_orders_cancelled",
+                        symbol=symbol, order_id=order.order_id,
+                        client_order_id=(order.raw or {}).get("clientOrderId"),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "orphan_order_cancel_failed",
+                        symbol=symbol, order_id=order.order_id, error=str(exc),
+                    )
+
+        await self._risk_event(
+            db, "info", "startup_reconciliation",
+            f"reconciled={reconciled} repaired={repaired} orphan_cancelled={orphan_cancelled}",
+            {"reconciled": reconciled, "repaired": repaired, "orphan_cancelled": orphan_cancelled},
+        )
+        await db.commit()
+
+    async def _startup_adapter_test(self, adapter: ExchangeAdapter) -> None:
+        """Phase 2B Branch 1: catch adapter implementation bugs before they affect real positions.
+
+        Posts a far-from-market STOP_MARKET (closePosition=True) on BTCUSDT and
+        immediately cancels it. The stopPrice is at mid * 0.5 — would only trigger
+        on a 50% drop in seconds, so it cannot fill during the placement window.
+        Logs success/failure but does not block the main loop from starting
+        (degraded path: if exchange-resting is broken, regular signals will
+        surface the same error and fall back to legacy polling).
+        """
+        symbol = "BTCUSDT"
+        try:
+            book = await adapter.fetch_order_book(symbol, limit=5)
+            mark = book.mid_price
+            if mark <= 0:
+                raise ValueError("mid price not available")
+        except Exception as exc:
+            logger.warning("startup_adapter_test_skip", reason=f"book fetch failed: {exc}")
+            return
+
+        request = OrderRequest(
+            symbol=symbol,
+            side="sell",
+            order_type="stop_market",
+            stop_price=mark * 0.5,  # far below market; cannot trigger in the placement window
+            close_position=True,
+            working_type="MARK_PRICE",
+            client_order_id=f"proscalp-test-{uuid4().hex[:18]}",
+        )
+        start = _time.perf_counter()
+        try:
+            result = await adapter.place_order(request)
+        except Exception as exc:
+            elapsed_ms = (_time.perf_counter() - start) * 1000.0
+            logger.error(
+                "startup_adapter_test_failed",
+                stage="place", error=str(exc), elapsed_ms=round(elapsed_ms, 1),
+            )
+            return
+
+        try:
+            await adapter.cancel_order(symbol, result.order_id)
+            elapsed_ms = (_time.perf_counter() - start) * 1000.0
+            logger.info(
+                "startup_adapter_test_ok",
+                order_id=result.order_id, elapsed_ms=round(elapsed_ms, 1),
+            )
+        except Exception as exc:
+            logger.warning(
+                "startup_adapter_test_cancel_failed",
+                order_id=result.order_id, error=str(exc),
+            )
 
     async def stop(self) -> BotRuntimeStatus:
         self.status.enabled = False
@@ -645,7 +836,7 @@ class BotRunner:
 
         manager = OrderManager(adapter, risk_engine=self.risk_engine, paper=self.paper, settings=self.settings)
         report = await manager.execute_signal(signal, permission, position_size.quantity)
-        await self._persist_execution(
+        trade = await self._persist_execution(
             db,
             scored,
             report=report,
@@ -655,6 +846,39 @@ class BotRunner:
             session=session,
             regime=regime,
         )
+
+        # Phase 2B Branch 1: attach exchange-resting protective orders for live/testnet futures
+        # entries that filled. Failure falls back to legacy mid-price polling (logged loudly).
+        if (
+            report.accepted
+            and trade is not None
+            and trade.status == "open"
+            and self._use_exchange_resting_exits()
+            and report.order_result is not None
+        ):
+            protective = await manager.attach_protective_orders(signal, trade.id)
+            extra = dict(trade.extra or {})
+            extra["protective_orders_attached_ms"] = round(protective.elapsed_ms, 1)
+            if protective.success:
+                extra["exchange_resting_active"] = True
+                extra["stop_order_id"] = protective.stop_order_id
+                extra["take_profit_order_id"] = protective.take_profit_order_id
+            else:
+                extra["exchange_resting_active"] = False
+                extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
+                await self._risk_event(
+                    db, "warning", "protective_orders_failed",
+                    "; ".join(protective.reasons) or "attach_protective_orders failed",
+                    {"trade_id": trade.id, "symbol": signal.symbol,
+                     "stop_order_id": protective.stop_order_id,
+                     "take_profit_order_id": protective.take_profit_order_id},
+                )
+            trade.extra = extra
+            await self._record_protective_attach_outcome(
+                db, protective.success,
+                context={"trade_id": trade.id, "symbol": signal.symbol, "source": "entry_attach"},
+            )
+
         if not report.accepted:
             await self._risk_event(
                 db,
@@ -680,6 +904,85 @@ class BotRunner:
         )
         return True
 
+    def _use_exchange_resting_exits(self) -> bool:
+        """Phase 2B Branch 1: are exchange-resting protective orders active?
+
+        Requires the feature flag, futures market type, and a non-paper mode
+        (testnet or live). Paper mode keeps the simulator authoritative.
+
+        Circuit-breaker (refinement 2): if attach_protective_orders has failed
+        >= protective_orders_failure_threshold times in the rolling
+        protective_orders_failure_window_hours window, returns False for the
+        rest of the UTC day, auto-resetting at the next UTC day-start.
+        """
+        if not (
+            self.settings.exchange_resting_exits_enabled
+            and self.settings.is_futures_mode
+            and self.settings.trading_mode != TradingMode.PAPER
+        ):
+            return False
+        today = datetime.now(timezone.utc).date()
+        if self._resting_disabled_until_utc_day is None:
+            return True
+        if self._resting_disabled_until_utc_day == today:
+            return False  # circuit-breaker tripped today
+        # Past trip date is < today -> auto-reset.
+        self._resting_disabled_until_utc_day = None
+        return True
+
+    async def _record_protective_attach_outcome(
+        self, db: AsyncSession, success: bool, *, context: dict | None = None
+    ) -> bool:
+        """Record an attach_protective_orders outcome. Trips the circuit-breaker
+        when failures within the rolling window meet the threshold.
+
+        Returns True if this call tripped the breaker (so callers can dedupe alerts).
+        """
+        if success:
+            return False
+        now = datetime.now(timezone.utc)
+        self._protective_failures.append(now)
+        cutoff = now - timedelta(hours=max(1, self.settings.protective_orders_failure_window_hours))
+        while self._protective_failures and self._protective_failures[0] < cutoff:
+            self._protective_failures.popleft()
+        if len(self._protective_failures) < self.settings.protective_orders_failure_threshold:
+            return False
+        # Trip the breaker.
+        self._resting_disabled_until_utc_day = now.date()
+        self._protective_failures.clear()
+        message = (
+            f"protective_orders circuit-breaker tripped: "
+            f"{self.settings.protective_orders_failure_threshold} failures within "
+            f"{self.settings.protective_orders_failure_window_hours}h; "
+            f"exchange-resting exits auto-disabled until UTC midnight"
+        )
+        await self._risk_event(
+            db, "warning", "protective_orders_circuit_breaker", message,
+            {**(context or {}),
+             "threshold": self.settings.protective_orders_failure_threshold,
+             "window_hours": self.settings.protective_orders_failure_window_hours,
+             "tripped_at_utc": now.isoformat()},
+        )
+        try:
+            await self.alerts.send("protective_orders_circuit_breaker", message)
+        except Exception as exc:  # pragma: no cover - alerting is best-effort
+            logger.warning("circuit_breaker_alert_failed", error=str(exc))
+        logger.warning(
+            "protective_orders_circuit_breaker_tripped",
+            threshold=self.settings.protective_orders_failure_threshold,
+            window_hours=self.settings.protective_orders_failure_window_hours,
+        )
+        return True
+
+    def _use_paper_sim_wiring(self) -> bool:
+        """Phase 2B Branch 1: in paper mode, route exits through the simulator
+        instead of the mid-price polling logic. Eliminates the split-brain
+        where the simulator's equity never moved on closes (only fees)."""
+        return (
+            self.settings.paper_sim_wired_to_live_loop
+            and self.settings.trading_mode == TradingMode.PAPER
+        )
+
     async def _persist_execution(
         self,
         db: AsyncSession,
@@ -690,7 +993,7 @@ class BotRunner:
         position_size,
         session: SessionState,
         regime: RegimeResult,
-    ) -> None:
+    ) -> Trade | None:
         signal = scored.signal
         trade: Trade | None = None
         if report.accepted and (report.paper_position or report.order_result):
@@ -754,10 +1057,118 @@ class BotRunner:
                     raw_response=report.order_result.raw,
                 )
             )
+        return trade
 
     async def _manage_open_trades(self, db: AsyncSession, adapter: ExchangeAdapter) -> None:
         trades = await self._open_database_trades(db)
         self.status.open_trade_count = len(trades)
+
+        # Phase 2B Branch 1: split trades across three exit paths.
+        #   - resting:   exchange-resting protective orders (live/testnet futures)
+        #   - paper_sim: paper simulator authoritative (paper mode + flag ON)
+        #   - legacy:    original mid-price polling
+        use_resting = self._use_exchange_resting_exits()
+        use_paper_sim = self._use_paper_sim_wiring()
+        resting_trades: list[Trade] = []
+        paper_sim_trades: list[Trade] = []
+        legacy_trades: list[Trade] = []
+        for t in trades:
+            if use_resting and (t.extra or {}).get("exchange_resting_active"):
+                resting_trades.append(t)
+            elif use_paper_sim:
+                paper_sim_trades.append(t)
+            else:
+                legacy_trades.append(t)
+
+        if resting_trades:
+            await self._sync_exchange_resting_trades(db, adapter, resting_trades)
+        if paper_sim_trades:
+            await self._sync_paper_simulator_trades(db, adapter, paper_sim_trades)
+
+        for trade in legacy_trades:
+            try:
+                book = await adapter.fetch_order_book(trade.symbol, limit=20)
+                price = book.mid_price
+            except Exception:
+                continue
+            if price <= 0:
+                continue
+            trade.unrealized_pnl = self._unrealized_pnl(trade, price)
+            self._update_mfe_mae(trade, trade.unrealized_pnl)
+            await self._maybe_move_break_even(trade, price)
+            close_reason = self._close_reason(trade, price)
+            if close_reason:
+                await self._close_trade(db, adapter, trade, price, close_reason)
+                continue
+            await self._maybe_partial_exit(db, adapter, trade, price)
+
+    def _update_mfe_mae(self, trade: Trade, current_pnl: float) -> None:
+        """Phase 2B Branch 1: track per-trade max favorable / adverse excursion.
+
+        Stored in trade.extra so no schema migration. The polling loop calls
+        this at most once per cycle (~10s); resolution is coarse but adequate
+        for the next round of analysis. MFE >= 0, MAE <= 0 by construction.
+        """
+        if not self.settings.mfe_mae_logging_enabled:
+            return
+        extra = dict(trade.extra or {})
+        prev_mfe = float(extra.get("mfe_pnl") or 0.0)
+        prev_mae = float(extra.get("mae_pnl") or 0.0)
+        extra["mfe_pnl"] = max(prev_mfe, float(current_pnl))
+        extra["mae_pnl"] = min(prev_mae, float(current_pnl))
+        extra["mfe_mae_updated_at"] = utc_now().isoformat()
+        trade.extra = extra
+
+    async def _sync_exchange_resting_trades(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trades: list[Trade]
+    ) -> None:
+        """Phase 2B Branch 1: for trades with exchange-resting protective orders,
+        detect position closure on the exchange and finalize the DB Trade row.
+
+        Sync logic:
+          - position still present on the exchange -> nothing to do (still open)
+          - position gone -> trade was closed by stop or TP (or external action).
+            Query both order ids to attribute the close (fill_price + reason).
+        """
+        try:
+            positions = await adapter.fetch_positions()
+        except Exception as exc:
+            logger.warning("sync_resting_fetch_positions_failed", error=str(exc))
+            return
+        open_symbols = {p.symbol for p in positions}
+        positions_by_symbol = {p.symbol: p for p in positions}
+        for trade in trades:
+            if trade.symbol in open_symbols:
+                # Still open — update unrealized PnL + MFE/MAE from the exchange's view.
+                position = positions_by_symbol.get(trade.symbol)
+                if position is not None:
+                    trade.unrealized_pnl = float(position.unrealized_pnl)
+                    self._update_mfe_mae(trade, trade.unrealized_pnl)
+                continue
+            extra = dict(trade.extra or {})
+            stop_id = extra.get("stop_order_id")
+            tp_id = extra.get("take_profit_order_id")
+            fill_price, reason = await self._attribute_exchange_close(adapter, trade.symbol, stop_id, tp_id)
+            if fill_price <= 0:
+                try:
+                    book = await adapter.fetch_order_book(trade.symbol, limit=20)
+                    fill_price = book.mid_price
+                except Exception:
+                    fill_price = trade.entry_price
+            close_reason = reason or "exchange_resting_close"
+            await self._finalize_trade_close(db, trade, fill_price, close_reason)
+
+    async def _sync_paper_simulator_trades(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trades: list[Trade]
+    ) -> None:
+        """Phase 2B Branch 1: paper-mode exits driven by PaperTradingSimulator.
+
+        For each trade, fetch the current mid price, call paper.update_price,
+        and translate any returned PaperFills into DB Trade row updates.
+        Trade.id == PaperPosition.id (set in _persist_execution) so the
+        mapping is direct. Eliminates the split-brain where the simulator's
+        equity tracked only fees, not realized PnL.
+        """
         for trade in trades:
             try:
                 book = await adapter.fetch_order_book(trade.symbol, limit=20)
@@ -767,12 +1178,59 @@ class BotRunner:
             if price <= 0:
                 continue
             trade.unrealized_pnl = self._unrealized_pnl(trade, price)
-            await self._maybe_move_break_even(trade, price)
-            close_reason = self._close_reason(trade, price)
-            if close_reason:
-                await self._close_trade(db, adapter, trade, price, close_reason)
+            self._update_mfe_mae(trade, trade.unrealized_pnl)
+
+            fills = self.paper.update_price(trade.symbol, price)
+            for fill in fills:
+                if fill.trade_id != trade.id:
+                    continue
+                extra = dict(trade.extra or {})
+                trade.realized_pnl = float(trade.realized_pnl or 0.0) + float(fill.pnl)
+                trade.fees = float(trade.fees or 0.0) + float(fill.fee)
+                if fill.reason == "stop_loss":
+                    trade.quantity = 0.0
+                    trade.unrealized_pnl = 0.0
+                    trade.status = "closed"
+                    trade.closed_at = utc_now()
+                    extra["close_reason"] = "stop_loss"
+                    extra["remaining_quantity"] = 0.0
+                    trade.extra = extra
+                    self._record_closed_trade_outcome(trade)
+                elif fill.reason == "trailing_runner_target":
+                    trade.quantity = 0.0
+                    trade.unrealized_pnl = 0.0
+                    trade.status = "closed"
+                    trade.closed_at = utc_now()
+                    extra["close_reason"] = "final_take_profit"
+                    extra["remaining_quantity"] = 0.0
+                    trade.extra = extra
+                    self._record_closed_trade_outcome(trade)
+                elif fill.reason in ("tp1", "tp2"):
+                    trade.quantity = max(0.0, float(trade.quantity) - float(fill.quantity))
+                    extra[f"{fill.reason}_hit"] = True
+                    extra["remaining_quantity"] = trade.quantity
+                    trade.extra = extra
+
+    async def _attribute_exchange_close(
+        self, adapter: ExchangeAdapter, symbol: str, stop_id: str | None, tp_id: str | None
+    ) -> tuple[float, str]:
+        """Query stop and TP orders; return (fill_price, close_reason).
+
+        Returns (0.0, '') if neither order can be attributed (caller falls back
+        to mark price + a generic close reason).
+        """
+        for order_id, reason in ((stop_id, "stop_loss_exchange"), (tp_id, "take_profit_exchange")):
+            if not order_id:
                 continue
-            await self._maybe_partial_exit(db, adapter, trade, price)
+            try:
+                order = await adapter.fetch_order(symbol, order_id)
+            except NotImplementedError:
+                return 0.0, ""
+            except Exception:
+                continue
+            if order.status.lower() == "filled" and (order.average_price or 0) > 0:
+                return float(order.average_price), reason
+        return 0.0, ""
 
     async def _reconcile_pending_and_orphan_positions(self, db: AsyncSession, positions, open_orders) -> None:
         if self.settings.trading_mode == TradingMode.PAPER:
@@ -803,39 +1261,82 @@ class BotRunner:
         for position in positions:
             if position.symbol in open_symbols or position.symbol in pending_symbols:
                 continue
-            stop_pct = 0.0035
-            target_pct = [0.003, 0.005, 0.008]
+            # Phase 2B Branch 1: stop/TP defaults moved to settings (clarification A).
+            stop_pct = self.settings.orphan_reconcile_stop_pct
+            target_pct = list(self.settings.orphan_reconcile_tp_levels)
             if position.side == "long":
                 stop_loss = position.entry_price * (1 - stop_pct)
                 take_profit = [position.entry_price * (1 + pct) for pct in target_pct]
             else:
                 stop_loss = position.entry_price * (1 + stop_pct)
                 take_profit = [position.entry_price * (1 - pct) for pct in target_pct]
-            db.add(
-                Trade(
-                    symbol=position.symbol,
-                    side=position.side,
-                    exchange=self.settings.exchange.value,
-                    mode=self.settings.trading_mode.value,
+            take_profit_rounded = [round(price, 8) for price in take_profit]
+            orphan_trade = Trade(
+                symbol=position.symbol,
+                side=position.side,
+                exchange=self.settings.exchange.value,
+                mode=self.settings.trading_mode.value,
+                setup_name="Exchange reconciled position",
+                entry_price=position.entry_price,
+                stop_loss=round(stop_loss, 8),
+                take_profit={"levels": take_profit_rounded},
+                quantity=position.quantity,
+                status="open",
+                unrealized_pnl=position.unrealized_pnl,
+                extra={
+                    "reconciled_orphan_position": True,
+                    "entry_session": "unknown",
+                    "entry_regime": "unknown",
+                    "original_quantity": position.quantity,
+                    "remaining_quantity": position.quantity,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "break_even_moved": False,
+                },
+            )
+            db.add(orphan_trade)
+            await db.flush()
+
+            # Per clarification A: when exchange-resting exits are ON, orphans
+            # also get protective orders attached (so they participate in the
+            # same exit path as regular entries).
+            if self._use_exchange_resting_exits():
+                from app.execution.order_manager import OrderManager
+                from app.strategies.base_strategy import StrategySignal
+                adapter_for_attach = create_exchange_adapter(self.settings)
+                manager = OrderManager(
+                    adapter_for_attach, risk_engine=self.risk_engine,
+                    paper=self.paper, settings=self.settings,
+                )
+                synthetic_signal = StrategySignal(
                     setup_name="Exchange reconciled position",
+                    symbol=position.symbol,
+                    direction=position.side,
                     entry_price=position.entry_price,
                     stop_loss=round(stop_loss, 8),
-                    take_profit={"levels": [round(price, 8) for price in take_profit]},
-                    quantity=position.quantity,
-                    status="open",
-                    unrealized_pnl=position.unrealized_pnl,
-                    extra={
-                        "reconciled_orphan_position": True,
-                        "entry_session": "unknown",
-                        "entry_regime": "unknown",
-                        "original_quantity": position.quantity,
-                        "remaining_quantity": position.quantity,
-                        "tp1_hit": False,
-                        "tp2_hit": False,
-                        "break_even_moved": False,
-                    },
+                    take_profit_levels=take_profit_rounded,
+                    trailing_stop=0.0,
+                    expected_move=0.0,
+                    risk_reward_ratio=0.0,
+                    confidence_score=0.0,
+                    accepted=True,
                 )
-            )
+                protective = await manager.attach_protective_orders(synthetic_signal, orphan_trade.id)
+                extra = dict(orphan_trade.extra or {})
+                extra["protective_orders_attached_ms"] = round(protective.elapsed_ms, 1)
+                if protective.success:
+                    extra["exchange_resting_active"] = True
+                    extra["stop_order_id"] = protective.stop_order_id
+                    extra["take_profit_order_id"] = protective.take_profit_order_id
+                else:
+                    extra["exchange_resting_active"] = False
+                    extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
+                orphan_trade.extra = extra
+                await self._record_protective_attach_outcome(
+                    db, protective.success,
+                    context={"trade_id": orphan_trade.id, "symbol": position.symbol, "source": "orphan_reconcile"},
+                )
+
             await self._risk_event(
                 db,
                 "warning",
