@@ -165,6 +165,18 @@ class BotRunner:
         self.status.last_error = None
         self._remember("Bot started; autonomous loop armed")
 
+        # Phase 2B Branch 2: flag-consistency guard. The ladder REQUIRES resting
+        # orders to function; ladder-on while resting-off is invalid. Disable the
+        # ladder in-memory and log loudly rather than run a broken configuration.
+        if self.settings.five_tier_ladder_enabled and not self.settings.exchange_resting_exits_enabled:
+            logger.error(
+                "ladder_flag_inconsistent",
+                detail="five_tier_ladder_enabled=True requires exchange_resting_exits_enabled=True; "
+                       "disabling ladder in-memory for this run",
+            )
+            self._remember("Config error: ladder enabled without resting exits; ladder disabled")
+            self.settings.five_tier_ladder_enabled = False
+
         # Phase 2B Branch 1: startup reconciliation + adapter smoke test.
         # Wrapped so a failure logs loudly but does not block the main loop —
         # the loop's per-cycle sync will eventually pick up state divergence.
