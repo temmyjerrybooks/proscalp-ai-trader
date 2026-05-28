@@ -84,7 +84,9 @@ Production image: `proscalp-ai-trader-backend:latest`, built from [backend/Docke
 
 **Branch 1 — `phase-2b-foundation`:** DEPLOYED 2026-05-28 (merged to main). Measurement-only active; trading-impact flags off until Branch 2.
 
-**Branch 2 — `phase-2b-exits`:** not started. Builds on Branch 1: BE+ stop, 5-tier TP ladder, stop progression, trailing stop on runner, time-based exits, slippage anomaly logging.
+**Branch 2 — `phase-2b-exits`:** investigation phase (2026-05-28). Activates `exchange_resting_exits_enabled` + builds BE+ stop, 5-tier TP ladder (4×20% tiers + 20% trailing runner), stop progression (BE+ → +0.2% → +0.5% → +1.0%), trailing runner, time-based exits (partial 15min / full 45min), slippage anomaly logging. Signals/regime/volume are explicitly OUT (Phase 2C).
+
+> **Branch 2 success criterion:** judged on **150 trades counted fresh** from the moment `exchange_resting_exits_enabled` goes live in production. One trade = one position **fully closed** (all tiers + runner done), counted at final exit. Pre-activation trades are "before" comparison only — never added to the 150. **Positive net PnL across those 150 = success.** If exits are clean but the bot is still negative at 150, the signal layer becomes the prime suspect and Phase 2C focuses there.
 
 **Branch 3 — `phase-2b-safety`:** not started. Flash-crash detection + daily reconciliation alert.
 
