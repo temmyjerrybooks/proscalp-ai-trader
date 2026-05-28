@@ -48,9 +48,9 @@ ProScalp is a Python crypto scalping bot. Stack: FastAPI + asyncio, SQLAlchemy +
 
 **Phase 2A evaluation (first 50 closes, 2026-05-23…24):** net **+$18.16**, win **56.0%**, PF **1.57**. Full breakdown: [docs/phase-2a-evaluation.md](docs/phase-2a-evaluation.md).
 
-### Phase 2B Branch 1 — IMPLEMENTED, NOT DEPLOYED (branch `phase-2b-foundation`)
+### Phase 2B Branch 1 — DEPLOYED 2026-05-28 (branch `phase-2b-foundation`, merged to main)
 
-Foundation work (items 1–4 + clarifications) merged-ready but awaiting staging+deploy approval. All new flags default OFF for trading-impact, ON for measurement.
+Foundation work (items 1–4 + clarifications + circuit-breaker) live on testnet. All new flags default OFF for trading-impact, ON for measurement. Deploy verified zero trading change (no protective orders, no market orders, legacy exit path unchanged); MFE/MAE + fee-aware shadow confirmed populating. Post-deploy trading anchor: ~+$12.68 / 154 closed / 51.9% win (since Phase 2A deploy).
 
 - `exchange_resting_exits_enabled = False` — when ON (non-paper futures only), after entry fill posts `STOP_MARKET` + `TAKE_PROFIT_MARKET` (`closePosition=True`, `workingType=MARK_PRICE`) via `OrderManager.attach_protective_orders`. Polling loop switches to *sync-from-exchange* for resting trades. **No partial exits in Branch 1** — Branch 2 adds the 5-tier TP ladder.
 - `mfe_mae_logging_enabled = True` — per-cycle `mfe_pnl` / `mae_pnl` tracked on `trade.extra` (no schema migration). Works for both exit paths.
@@ -82,7 +82,7 @@ Production image: `proscalp-ai-trader-backend:latest`, built from [backend/Docke
 
 ## Next planned work (Phase 2B)
 
-**Branch 1 — `phase-2b-foundation`:** IMPLEMENTED locally; awaiting staging+deploy approval. (Items 1-4 + clarifications A/B/C + startup adapter test.)
+**Branch 1 — `phase-2b-foundation`:** DEPLOYED 2026-05-28 (merged to main). Measurement-only active; trading-impact flags off until Branch 2.
 
 **Branch 2 — `phase-2b-exits`:** not started. Builds on Branch 1: BE+ stop, 5-tier TP ladder, stop progression, trailing stop on runner, time-based exits, slippage anomaly logging.
 
