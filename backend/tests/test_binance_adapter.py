@@ -119,3 +119,62 @@ async def test_place_stop_market_without_stop_price_raises():
     req = OrderRequest(symbol="BTCUSDT", side="sell", order_type="stop_market", close_position=True)
     with pytest.raises(ValueError, match="requires stop_price"):
         await adapter.place_order(req)
+
+
+# ---- Phase 2B Branch 2: reduceOnly TP tier + TRAILING_STOP_MARKET runner params ----
+
+
+@pytest.mark.asyncio
+async def test_place_reduce_only_tp_tier_sends_quantity_and_reduceonly(monkeypatch):
+    """A ladder TP tier is a reduceOnly quantity order (NOT closePosition) so it
+    can express a partial size."""
+    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
+    async def _fake_rules(_): return _RULES
+    captured: dict = {}
+    async def _fake_signed(method, path, params=None):
+        captured["params"] = dict(params or {}); return {"orderId": 7, "status": "NEW"}
+    monkeypatch.setattr(adapter, "fetch_symbol_rules", _fake_rules)
+    monkeypatch.setattr(adapter, "_signed_request", _fake_signed)
+    req = OrderRequest(
+        symbol="BTCUSDT", side="sell", order_type="take_profit_market",
+        quantity=0.05, stop_price=50250.0, reduce_only=True, working_type="MARK_PRICE",
+    )
+    await adapter.place_order(req)
+    params = captured["params"]
+    assert params["type"] == "TAKE_PROFIT_MARKET"
+    assert params["quantity"] == "0.05"
+    assert params["reduceOnly"] == "true"
+    assert "closePosition" not in params
+    assert params["stopPrice"] == "50250"
+
+
+@pytest.mark.asyncio
+async def test_place_trailing_stop_market_sends_callback_and_activation(monkeypatch):
+    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
+    async def _fake_rules(_): return _RULES
+    captured: dict = {}
+    async def _fake_signed(method, path, params=None):
+        captured["params"] = dict(params or {}); return {"orderId": 9, "status": "NEW"}
+    monkeypatch.setattr(adapter, "fetch_symbol_rules", _fake_rules)
+    monkeypatch.setattr(adapter, "_signed_request", _fake_signed)
+    req = OrderRequest(
+        symbol="BTCUSDT", side="sell", order_type="trailing_stop_market",
+        quantity=0.02, callback_rate=0.6, activation_price=50500.0,
+        reduce_only=True, working_type="MARK_PRICE",
+    )
+    await adapter.place_order(req)
+    params = captured["params"]
+    assert params["type"] == "TRAILING_STOP_MARKET"
+    assert params["callbackRate"] == "0.6"
+    assert params["activationPrice"] == "50500"
+    assert params["quantity"] == "0.02"
+    assert params["reduceOnly"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_place_trailing_stop_market_without_callback_raises():
+    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
+    adapter._symbol_rules_cache["BTCUSDT"] = _RULES  # avoid the HTTP rules fetch
+    req = OrderRequest(symbol="BTCUSDT", side="sell", order_type="trailing_stop_market", quantity=0.02)
+    with pytest.raises(ValueError, match="requires callback_rate"):
+        await adapter.place_order(req)
