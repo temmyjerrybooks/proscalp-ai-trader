@@ -186,6 +186,7 @@ class BinanceAdapter(ExchangeAdapter):
 
     async def place_order(self, request: OrderRequest) -> OrderResult:
         rules = await self.fetch_symbol_rules(request.symbol)
+        is_trailing = request.order_type == "trailing_stop_market"
         is_protective = request.order_type in ("stop_market", "take_profit_market")
         is_whole_position = is_protective and request.close_position
 
@@ -228,6 +229,17 @@ class BinanceAdapter(ExchangeAdapter):
             params["stopPrice"] = self._format_price(stop_price, int(rules["price_precision"]))
             if request.close_position:
                 params["closePosition"] = "true"
+            if request.working_type:
+                params["workingType"] = request.working_type
+        if is_trailing:
+            # Binance TRAILING_STOP_MARKET: callbackRate (0.1–10, 1-decimal precision)
+            # is mandatory; activationPrice is optional (defers trailing until reached).
+            if request.callback_rate is None:
+                raise ValueError("trailing_stop_market requires callback_rate")
+            params["callbackRate"] = f"{request.callback_rate:.1f}"
+            if request.activation_price is not None:
+                activation = self._round_price(request.activation_price, rules, up=False)
+                params["activationPrice"] = self._format_price(activation, int(rules["price_precision"]))
             if request.working_type:
                 params["workingType"] = request.working_type
         # Binance rejects reduceOnly + closePosition together; closePosition already implies it.

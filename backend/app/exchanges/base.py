@@ -9,8 +9,9 @@ from typing import Any, Literal
 Side = Literal["buy", "sell"]
 Direction = Literal["long", "short"]
 # Phase 2B: stop_market / take_profit_market are exchange-resting protective orders
-# (Binance Futures STOP_MARKET / TAKE_PROFIT_MARKET).
-OrderType = Literal["market", "limit", "stop_market", "take_profit_market"]
+# (Binance Futures STOP_MARKET / TAKE_PROFIT_MARKET). Branch 2 adds
+# trailing_stop_market (Binance Futures TRAILING_STOP_MARKET) for the ladder runner.
+OrderType = Literal["market", "limit", "stop_market", "take_profit_market", "trailing_stop_market"]
 TimeInForce = Literal["GTC", "IOC", "FOK", "GTX"]
 # Binance Futures workingType: CONTRACT_PRICE (last) or MARK_PRICE (mark).
 # MARK_PRICE is generally safer for protective orders (resistant to thin-book wicks).
@@ -104,6 +105,9 @@ class OrderRequest:
     stop_price: float | None = None
     close_position: bool = False  # Binance Futures: closes the whole position when trigger fires
     working_type: WorkingType | None = None  # defaults to exchange default (CONTRACT_PRICE) if None
+    # Phase 2B Branch 2 — for trailing_stop_market (the ladder runner):
+    callback_rate: float | None = None  # trailing distance as a percent (Binance: 0.1–10.0)
+    activation_price: float | None = None  # price at which trailing begins (Binance activationPrice)
 
 
 @dataclass(slots=True)

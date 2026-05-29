@@ -27,6 +27,7 @@ from app.database.models import (
     Trade,
     utc_now,
 )
+from app.execution.exit_ladder import compute_target_stop, should_arm_be_plus, time_exit_decision
 from app.execution.order_manager import OrderManager
 from app.exchanges.base import Candle, ExchangeAdapter, OrderRequest, Position
 from app.exchanges.factory import create_exchange_adapter
@@ -164,6 +165,18 @@ class BotRunner:
         self.status.emergency_stopped = False
         self.status.last_error = None
         self._remember("Bot started; autonomous loop armed")
+
+        # Phase 2B Branch 2: flag-consistency guard. The ladder REQUIRES resting
+        # orders to function; ladder-on while resting-off is invalid. Disable the
+        # ladder in-memory and log loudly rather than run a broken configuration.
+        if self.settings.five_tier_ladder_enabled and not self.settings.exchange_resting_exits_enabled:
+            logger.error(
+                "ladder_flag_inconsistent",
+                detail="five_tier_ladder_enabled=True requires exchange_resting_exits_enabled=True; "
+                       "disabling ladder in-memory for this run",
+            )
+            self._remember("Config error: ladder enabled without resting exits; ladder disabled")
+            self.settings.five_tier_ladder_enabled = False
 
         # Phase 2B Branch 1: startup reconciliation + adapter smoke test.
         # Wrapped so a failure logs loudly but does not block the main loop —
@@ -847,8 +860,10 @@ class BotRunner:
             regime=regime,
         )
 
-        # Phase 2B Branch 1: attach exchange-resting protective orders for live/testnet futures
-        # entries that filled. Failure falls back to legacy mid-price polling (logged loudly).
+        # Phase 2B: attach exchange-resting exits for live/testnet futures entries
+        # that filled. Branch 2 (ladder flag ON) attaches the 5-tier ladder;
+        # otherwise Branch 1's single stop+TP. Failure falls back to legacy
+        # mid-price polling (logged loudly).
         if (
             report.accepted
             and trade is not None
@@ -856,28 +871,10 @@ class BotRunner:
             and self._use_exchange_resting_exits()
             and report.order_result is not None
         ):
-            protective = await manager.attach_protective_orders(signal, trade.id)
-            extra = dict(trade.extra or {})
-            extra["protective_orders_attached_ms"] = round(protective.elapsed_ms, 1)
-            if protective.success:
-                extra["exchange_resting_active"] = True
-                extra["stop_order_id"] = protective.stop_order_id
-                extra["take_profit_order_id"] = protective.take_profit_order_id
+            if self._use_ladder_exits():
+                await self._attach_ladder_exits(db, manager, signal, trade, scored)
             else:
-                extra["exchange_resting_active"] = False
-                extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
-                await self._risk_event(
-                    db, "warning", "protective_orders_failed",
-                    "; ".join(protective.reasons) or "attach_protective_orders failed",
-                    {"trade_id": trade.id, "symbol": signal.symbol,
-                     "stop_order_id": protective.stop_order_id,
-                     "take_profit_order_id": protective.take_profit_order_id},
-                )
-            trade.extra = extra
-            await self._record_protective_attach_outcome(
-                db, protective.success,
-                context={"trade_id": trade.id, "symbol": signal.symbol, "source": "entry_attach"},
-            )
+                await self._attach_branch1_protective(db, manager, signal, trade)
 
         if not report.accepted:
             await self._risk_event(
@@ -974,6 +971,140 @@ class BotRunner:
         )
         return True
 
+    def _use_ladder_exits(self) -> bool:
+        """Phase 2B Branch 2: is the full 5-tier ladder active? Requires the
+        ladder flag AND all of the Branch 1 exchange-resting preconditions
+        (and respects the circuit-breaker via _use_exchange_resting_exits)."""
+        return self.settings.five_tier_ladder_enabled and self._use_exchange_resting_exits()
+
+    def _entry_atr(self, scored: ScoredSignal) -> float:
+        """Capture the literal 14-period ATR at entry (5m primary, 3m fallback).
+
+        Persisted on the trade so the management loop can size BE+ arming, the
+        runner trail, and tier checks consistently. Falls back to the risk
+        distance |entry-stop| if no usable candle history is available."""
+        context = scored.context
+        for timeframe in ("5m", "3m"):
+            candles = context.candles_by_timeframe.get(timeframe) or []
+            if len(candles) >= 15:
+                snapshot = build_indicator_snapshot(candles)
+                if snapshot and snapshot.atr > 0:
+                    return float(snapshot.atr)
+        return abs(scored.signal.entry_price - scored.signal.stop_loss)
+
+    async def _attach_branch1_protective(
+        self, db: AsyncSession, manager: OrderManager, signal: StrategySignal, trade: Trade
+    ) -> None:
+        """Phase 2B Branch 1: single stop+TP exchange-resting orders (unchanged)."""
+        protective = await manager.attach_protective_orders(signal, trade.id)
+        extra = dict(trade.extra or {})
+        extra["protective_orders_attached_ms"] = round(protective.elapsed_ms, 1)
+        if protective.success:
+            extra["exchange_resting_active"] = True
+            extra["stop_order_id"] = protective.stop_order_id
+            extra["take_profit_order_id"] = protective.take_profit_order_id
+        else:
+            extra["exchange_resting_active"] = False
+            extra["protective_orders_failed"] = "; ".join(protective.reasons) or "unknown"
+            await self._risk_event(
+                db, "warning", "protective_orders_failed",
+                "; ".join(protective.reasons) or "attach_protective_orders failed",
+                {"trade_id": trade.id, "symbol": signal.symbol,
+                 "stop_order_id": protective.stop_order_id,
+                 "take_profit_order_id": protective.take_profit_order_id},
+            )
+        trade.extra = extra
+        await self._record_protective_attach_outcome(
+            db, protective.success,
+            context={"trade_id": trade.id, "symbol": signal.symbol, "source": "entry_attach"},
+        )
+
+    async def _attach_ladder_exits(
+        self, db: AsyncSession, manager: OrderManager,
+        signal: StrategySignal, trade: Trade, scored: ScoredSignal,
+    ) -> None:
+        """Phase 2B Branch 2: attach the 5-tier ladder for a filled entry.
+
+        Min-notional Option A: if the position is too small to split into tiers,
+        gracefully degrade to the Branch 1 single stop+TP path (still protected,
+        never naked). Circuit-breaker counts a missing STOP as the failure signal.
+        """
+        atr = self._entry_atr(scored)
+        plan = await manager.build_ladder_plan(
+            direction=signal.direction, entry_price=trade.entry_price,
+            stop_loss=signal.stop_loss, atr=atr, quantity=trade.quantity, symbol=signal.symbol,
+        )
+        extra = dict(trade.extra or {})
+        extra["entry_atr"] = round(atr, 10)
+
+        if not plan.is_ladder:
+            logger.info("ladder_min_notional_degraded", trade_id=trade.id,
+                        symbol=signal.symbol, reason=plan.degraded_reason)
+            await self._risk_event(
+                db, "info", "ladder_min_notional_degraded",
+                f"{signal.symbol} ladder degraded to single TP: {plan.degraded_reason}",
+                {"trade_id": trade.id, "symbol": signal.symbol, "reason": plan.degraded_reason},
+            )
+            trade.extra = extra  # persist entry_atr before the Branch 1 fallback overwrites extra
+            await self._attach_branch1_protective(db, manager, signal, trade)
+            return
+
+        result = await manager.attach_ladder_orders(plan, signal.symbol, signal.direction, trade.id)
+        extra["protective_orders_attached_ms"] = round(result.elapsed_ms, 1)
+        extra["ladder_mode"] = result.mode
+        if result.ladder_active:
+            extra["exchange_resting_active"] = True
+            extra["ladder_active"] = True
+            extra["stop_order_id"] = result.stop_order_id
+            extra["tier_orders"] = [
+                {"index": t.index, "order_id": t.order_id, "price": t.price,
+                 "quantity": t.quantity, "filled": False}
+                for t in result.tier_orders
+            ]
+            extra["runner_order_id"] = result.runner_order_id
+            extra["runner_activation_price"] = plan.runner_activation_price
+            extra["runner_callback_rate"] = plan.runner_callback_rate
+            extra["tiers_filled"] = 0
+            extra["be_plus_armed"] = False
+            extra["runner_active"] = False
+            extra["time_partial_done"] = False
+            extra["original_quantity"] = trade.quantity
+            extra["remaining_quantity"] = trade.quantity
+            # Baseline for the tier-fill cross-check anomaly. Reset on the 15-min
+            # re-ladder so the partial time-exit's own bookkeeping never trips it.
+            extra["ladder_base_quantity"] = trade.quantity
+            await self._risk_event(
+                db, "info", "ladder_attached",
+                f"{signal.symbol} {result.mode} ladder: {len(result.tier_orders)} tiers, "
+                f"runner={'yes' if result.runner_order_id else 'no'}",
+                {"trade_id": trade.id, "symbol": signal.symbol, "mode": result.mode,
+                 "tiers": len(result.tier_orders), "stop_order_id": result.stop_order_id,
+                 "runner_order_id": result.runner_order_id,
+                 "runner_callback_rate": plan.runner_callback_rate},
+            )
+            if result.reasons:
+                await self._risk_event(
+                    db, "warning", "ladder_partial_attach", "; ".join(result.reasons),
+                    {"trade_id": trade.id, "symbol": signal.symbol},
+                )
+        else:
+            extra["exchange_resting_active"] = False
+            extra["ladder_active"] = False
+            extra["protective_orders_failed"] = "; ".join(result.reasons) or "ladder attach failed"
+            await self._risk_event(
+                db, "warning", "protective_orders_failed",
+                "; ".join(result.reasons) or "attach_ladder_orders failed",
+                {"trade_id": trade.id, "symbol": signal.symbol,
+                 "stop_order_id": result.stop_order_id},
+            )
+        trade.extra = extra
+        # The marching STOP is the safety-critical order; treat its absence as the
+        # circuit-breaker failure signal (tier/runner partials are logged separately).
+        await self._record_protective_attach_outcome(
+            db, result.stop_order_id is not None,
+            context={"trade_id": trade.id, "symbol": signal.symbol, "source": "entry_attach_ladder"},
+        )
+
     def _use_paper_sim_wiring(self) -> bool:
         """Phase 2B Branch 1: in paper mode, route exits through the simulator
         instead of the mid-price polling logic. Eliminates the split-brain
@@ -1063,23 +1194,31 @@ class BotRunner:
         trades = await self._open_database_trades(db)
         self.status.open_trade_count = len(trades)
 
-        # Phase 2B Branch 1: split trades across three exit paths.
-        #   - resting:   exchange-resting protective orders (live/testnet futures)
+        # Phase 2B: split trades across exit paths (most specific first).
+        #   - ladder:    Branch 2 five-tier ladder (resting + ladder flag ON)
+        #   - resting:   Branch 1 single stop+TP exchange-resting orders
         #   - paper_sim: paper simulator authoritative (paper mode + flag ON)
         #   - legacy:    original mid-price polling
+        use_ladder = self._use_ladder_exits()
         use_resting = self._use_exchange_resting_exits()
         use_paper_sim = self._use_paper_sim_wiring()
+        ladder_trades: list[Trade] = []
         resting_trades: list[Trade] = []
         paper_sim_trades: list[Trade] = []
         legacy_trades: list[Trade] = []
         for t in trades:
-            if use_resting and (t.extra or {}).get("exchange_resting_active"):
+            extra = t.extra or {}
+            if use_ladder and extra.get("ladder_active"):
+                ladder_trades.append(t)
+            elif use_resting and extra.get("exchange_resting_active"):
                 resting_trades.append(t)
             elif use_paper_sim:
                 paper_sim_trades.append(t)
             else:
                 legacy_trades.append(t)
 
+        if ladder_trades:
+            await self._sync_ladder_trades(db, adapter, ladder_trades)
         if resting_trades:
             await self._sync_exchange_resting_trades(db, adapter, resting_trades)
         if paper_sim_trades:
@@ -1157,6 +1296,348 @@ class BotRunner:
                     fill_price = trade.entry_price
             close_reason = reason or "exchange_resting_close"
             await self._finalize_trade_close(db, trade, fill_price, close_reason)
+
+    async def _sync_ladder_trades(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trades: list[Trade]
+    ) -> None:
+        """Phase 2B Branch 2: per-cycle management of five-tier ladder positions.
+
+        For each ladder trade:
+          - position gone from the exchange -> finalize + cancel leftover orders
+          - still open -> detect tier fills, arm BE+, ratchet the marching stop,
+            flag runner activation, and apply time-based exits.
+        Every state transition emits an audit RiskEvent.
+        """
+        try:
+            positions = await adapter.fetch_positions()
+        except Exception as exc:
+            logger.warning("sync_ladder_fetch_positions_failed", error=str(exc))
+            return
+        positions_by_symbol = {p.symbol: p for p in positions}
+        manager = OrderManager(adapter, risk_engine=self.risk_engine, paper=self.paper, settings=self.settings)
+
+        for trade in trades:
+            extra = dict(trade.extra or {})
+            position = positions_by_symbol.get(trade.symbol)
+            if position is None:
+                await self._finalize_ladder_close(db, adapter, manager, trade, extra)
+                continue
+
+            mark = float(position.mark_price) if (position.mark_price or 0) > 0 else 0.0
+            if mark <= 0:
+                try:
+                    mark = (await adapter.fetch_order_book(trade.symbol, limit=20)).mid_price
+                except Exception:
+                    mark = trade.entry_price
+            trade.unrealized_pnl = self._unrealized_pnl(trade, mark)
+            self._update_mfe_mae(trade, trade.unrealized_pnl)
+            finalized = await self._ladder_manage_open(db, adapter, manager, trade, extra, position, mark)
+            if not finalized:
+                trade.extra = extra
+
+    async def _ladder_manage_open(
+        self, db: AsyncSession, adapter: ExchangeAdapter, manager: OrderManager,
+        trade: Trade, extra: dict, position: Position, mark: float,
+    ) -> bool:
+        """Manage an open ladder position for one cycle. Returns True if the trade
+        was finalized (closed) this cycle, so the caller skips the extra write."""
+        atr = float(extra.get("entry_atr") or 0.0) or abs(trade.entry_price - trade.stop_loss)
+
+        # 1) Detect tier fills (resting TP order no longer open == filled).
+        await self._ladder_detect_tier_fills(db, adapter, trade, extra, mark)
+        tier_orders = extra.get("tier_orders") or []
+        tiers_filled = sum(1 for t in tier_orders if t.get("filled"))
+        extra["tiers_filled"] = tiers_filled
+        # Keep trade.quantity synced to the exchange remainder so finalize_close
+        # prices only the un-realized chunk (filled tiers already booked).
+        trade.quantity = float(position.quantity)
+        extra["remaining_quantity"] = float(position.quantity)
+
+        # 2) Arm BE+ on the first favorable 0.5xATR move.
+        be_plus_armed = bool(extra.get("be_plus_armed"))
+        if not be_plus_armed and should_arm_be_plus(
+            direction=trade.side, entry_price=trade.entry_price,
+            mark_price=mark, atr=atr, settings=self.settings,
+        ):
+            be_plus_armed = True
+            extra["be_plus_armed"] = True
+            await self._risk_event(
+                db, "info", "ladder_be_plus_armed",
+                f"{trade.symbol} BE+ armed at mark {mark}",
+                {"trade_id": trade.id, "symbol": trade.symbol, "mark": mark, "atr": atr},
+            )
+
+        # 3) Ratchet the marching stop (worst-of-progression, never above market).
+        rules = await manager._symbol_rules(trade.symbol)
+        advance = compute_target_stop(
+            direction=trade.side, entry_price=trade.entry_price, current_stop=trade.stop_loss,
+            mark_price=mark, tiers_filled=tiers_filled, be_plus_armed=be_plus_armed,
+            rules=rules, settings=self.settings,
+        )
+        if advance.new_stop_price is not None:
+            old_stop_id = extra.get("stop_order_id")
+            new_id, issues = await manager.advance_ladder_stop(
+                trade.symbol, trade.side, advance.new_stop_price, old_stop_id,
+            )
+            if new_id:
+                extra["stop_order_id"] = new_id
+                trade.stop_loss = advance.new_stop_price
+                await self._risk_event(
+                    db, "info", "ladder_stop_advanced",
+                    f"{trade.symbol} stop -> {advance.new_stop_price} (offset {advance.offset_pct:.4f})",
+                    {"trade_id": trade.id, "symbol": trade.symbol, "old_stop_order_id": old_stop_id,
+                     "new_stop_order_id": new_id, "new_stop_price": advance.new_stop_price,
+                     "tiers_filled": tiers_filled, "be_plus_armed": be_plus_armed},
+                )
+            if issues:
+                logger.warning("ladder_stop_cancel_issues", symbol=trade.symbol, issues=issues)
+        elif advance.deferred:
+            logger.debug("ladder_stop_deferred", symbol=trade.symbol, reason=advance.reason)
+
+        # 4) Runner activation milestone (the order auto-activates via activationPrice).
+        if not extra.get("runner_active") and tier_orders and tiers_filled >= len(tier_orders):
+            extra["runner_active"] = True
+            await self._risk_event(
+                db, "info", "ladder_runner_active",
+                f"{trade.symbol} all tiers filled; trailing runner active",
+                {"trade_id": trade.id, "symbol": trade.symbol, "tiers_filled": tiers_filled},
+            )
+
+        # 5) Time-based exits.
+        opened = trade.opened_at
+        elapsed = (datetime.now(timezone.utc) - opened).total_seconds() if opened else 0.0
+        decision = time_exit_decision(elapsed, bool(extra.get("time_partial_done")), self.settings)
+        if decision == "full":
+            await self._ladder_time_full_exit(db, adapter, manager, trade, extra, position, mark)
+            return True
+        if decision == "partial":
+            await self._ladder_time_partial_exit(db, adapter, manager, trade, extra, position, mark, atr)
+        return False
+
+    async def _ladder_detect_tier_fills(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trade: Trade, extra: dict, mark: float,
+    ) -> None:
+        """Detect newly-filled TP tiers, book their realized PnL, and log slippage
+        anomalies (actual fill vs the tier trigger price)."""
+        tier_orders = extra.get("tier_orders") or []
+        unfilled = [t for t in tier_orders if not t.get("filled") and t.get("order_id")]
+        if not unfilled:
+            return
+        try:
+            open_ids = {o.order_id for o in await adapter.fetch_open_orders(trade.symbol)}
+        except Exception as exc:
+            logger.warning("sync_ladder_fetch_orders_failed", symbol=trade.symbol, error=str(exc))
+            return
+        # Cross-check baseline: the entry quantity of the *current* ladder (reset on
+        # the 15-min re-ladder). Running tally of filled tier quantity, seeded with
+        # tiers already booked in prior cycles.
+        base_qty = float(extra.get("ladder_base_quantity") or extra.get("original_quantity") or trade.quantity)
+        filled_qty = sum(float(t["quantity"]) for t in tier_orders if t.get("filled"))
+        newly_filled: list[tuple[dict, str]] = []  # (tier, fetch_order_status)
+        for tier in unfilled:
+            if tier["order_id"] in open_ids:
+                continue  # still resting
+            # No longer on the book -> treat as filled. Attribute the actual fill
+            # price when the adapter can report it; otherwise use the tier trigger.
+            fill_price = float(tier["price"])
+            order_status = "unknown"
+            try:
+                order = await adapter.fetch_order(trade.symbol, tier["order_id"])
+                order_status = order.status.lower()
+                if order_status == "filled" and (order.average_price or 0) > 0:
+                    fill_price = float(order.average_price)
+            except NotImplementedError:
+                order_status = "fetch_order_unsupported"
+            except Exception as exc:
+                logger.debug("ladder_tier_fetch_failed", symbol=trade.symbol, error=str(exc))
+            tier["filled"] = True
+            tier["fill_price"] = fill_price
+            filled_qty += float(tier["quantity"])
+            newly_filled.append((tier, order_status))
+            pnl = self._exit_pnl(trade, fill_price, float(tier["quantity"]))
+            trade.realized_pnl = float(trade.realized_pnl or 0.0) + pnl
+            await self._risk_event(
+                db, "info", "ladder_tier_filled",
+                f"{trade.symbol} TP{tier['index']} filled at {fill_price}",
+                {"trade_id": trade.id, "symbol": trade.symbol, "tier": tier["index"],
+                 "trigger_price": tier["price"], "fill_price": fill_price,
+                 "quantity": tier["quantity"], "pnl": round(pnl, 6)},
+            )
+            slippage_bps = abs(fill_price - float(tier["price"])) / max(float(tier["price"]), 1e-12) * 10_000
+            if slippage_bps > self.settings.slippage_anomaly_bps:
+                await self._risk_event(
+                    db, "warning", "ladder_slippage_anomaly",
+                    f"{trade.symbol} TP{tier['index']} slippage {slippage_bps:.1f} bps",
+                    {"trade_id": trade.id, "symbol": trade.symbol, "tier": tier["index"],
+                     "trigger_price": tier["price"], "fill_price": fill_price,
+                     "slippage_bps": round(slippage_bps, 1),
+                     "threshold_bps": self.settings.slippage_anomaly_bps},
+                )
+        extra["tier_orders"] = tier_orders
+        # Observational cross-check: run ONCE per cycle after all this cycle's fills
+        # are booked. The exchange position reflects fills cumulatively, so checking
+        # per-tier would false-positive whenever >1 tier fills in a single poll.
+        if newly_filled:
+            await self._ladder_sync_crosscheck(db, adapter, trade, newly_filled, base_qty, filled_qty)
+
+    async def _ladder_sync_crosscheck(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trade: Trade,
+        newly_filled: list[tuple[dict, str]], base_qty: float, filled_qty_to_date: float,
+    ) -> None:
+        """Observational tripwire for the cancel-vs-fill / no-cross-check tradeoffs.
+
+        After this cycle's tier fills are booked, compare the live exchange position
+        quantity against the filled-tier accounting. If they diverge by more than 5%
+        of the ladder's base quantity, emit a `ladder_sync_anomaly` RiskEvent. This
+        NEVER aborts detection — it is purely empirical evidence of whether the
+        detection heuristic ever misfires in practice (target: zero anomalies over
+        50+ trades). The extra fetch_positions call only happens on an actual fill.
+        """
+        if base_qty <= 0:
+            return
+        try:
+            positions = await adapter.fetch_positions()
+            exchange_qty = next((float(p.quantity) for p in positions if p.symbol == trade.symbol), 0.0)
+        except Exception as exc:
+            logger.debug("ladder_crosscheck_fetch_failed", symbol=trade.symbol, error=str(exc))
+            return  # could not read position this cycle; observational only
+        expected_remaining = base_qty - filled_qty_to_date
+        drift = abs(exchange_qty - expected_remaining) / base_qty
+        if drift > 0.05:
+            tiers = [t["index"] for t, _ in newly_filled]
+            statuses = {t["index"]: status for t, status in newly_filled}
+            await self._risk_event(
+                db, "warning", "ladder_sync_anomaly",
+                f"{trade.symbol} tiers {tiers} sync drift {drift * 100:.1f}%: "
+                f"exchange_qty={exchange_qty} expected_remaining={expected_remaining}",
+                {"trade_id": trade.id, "symbol": trade.symbol, "tiers": tiers,
+                 "exchange_quantity": exchange_qty, "expected_remaining": expected_remaining,
+                 "fetch_order_status": statuses,
+                 "filled_tier_quantities": round(filled_qty_to_date, 10),
+                 "ladder_base_quantity": base_qty,
+                 "drift_pct": round(drift * 100, 2),
+                 "timestamp": utc_now().isoformat()},
+            )
+
+    async def _finalize_ladder_close(
+        self, db: AsyncSession, adapter: ExchangeAdapter, manager: OrderManager,
+        trade: Trade, extra: dict,
+    ) -> None:
+        """Position gone from the exchange: attribute the close, cancel any leftover
+        ladder orders, finalize the DB row, and emit the 150-count audit event."""
+        stop_id = extra.get("stop_order_id")
+        runner_id = extra.get("runner_order_id")
+        unfilled_tier_ids = [t.get("order_id") for t in (extra.get("tier_orders") or []) if not t.get("filled")]
+
+        fill_price, reason = await self._attribute_exchange_close(adapter, trade.symbol, stop_id, runner_id)
+        if reason == "take_profit_exchange":
+            reason = "trailing_runner_exchange"
+        if fill_price <= 0:
+            try:
+                fill_price = (await adapter.fetch_order_book(trade.symbol, limit=20)).mid_price
+            except Exception:
+                fill_price = trade.entry_price
+        close_reason = reason or "ladder_resting_close"
+
+        issues = await manager.cancel_orders(trade.symbol, [stop_id, runner_id, *unfilled_tier_ids])
+        if issues:
+            logger.info("ladder_close_cancel_issues", symbol=trade.symbol, issues=issues)
+
+        extra["ladder_active"] = False
+        trade.extra = extra
+        await self._finalize_trade_close(db, trade, fill_price, close_reason)
+        await self._ladder_record_closed(db, trade, close_reason)
+
+    async def _ladder_time_partial_exit(
+        self, db: AsyncSession, adapter: ExchangeAdapter, manager: OrderManager,
+        trade: Trade, extra: dict, position: Position, mark: float, atr: float,
+    ) -> None:
+        """15-minute partial: cancel resting tiers + runner, market-close a fraction
+        of the remainder, then re-place the ladder for the new remaining quantity.
+        The marching stop is left intact (closePosition auto-sizes)."""
+        remaining = float(position.quantity)
+        if remaining <= 0:
+            extra["time_partial_done"] = True
+            return
+        tier_orders = extra.get("tier_orders") or []
+        cancel_ids = [t.get("order_id") for t in tier_orders if not t.get("filled")]
+        cancel_ids.append(extra.get("runner_order_id"))
+        await manager.cancel_orders(trade.symbol, cancel_ids)
+
+        close_qty = remaining * self.settings.time_exit_partial_pct
+        await self._send_reduce_only(adapter, trade, close_qty)
+        pnl = self._exit_pnl(trade, mark, close_qty)
+        trade.realized_pnl = float(trade.realized_pnl or 0.0) + pnl
+        new_remaining = max(0.0, remaining - close_qty)
+        trade.quantity = new_remaining
+
+        plan = await manager.build_ladder_plan(
+            direction=trade.side, entry_price=trade.entry_price, stop_loss=trade.stop_loss,
+            atr=atr, quantity=new_remaining, symbol=trade.symbol,
+        )
+        re_laddered = plan.is_ladder
+        if re_laddered:
+            tiers, runner_id, reasons = await manager.replace_ladder_tiers(
+                plan, trade.symbol, trade.side, trade.id,
+            )
+            extra["tier_orders"] = [
+                {"index": t.index, "order_id": t.order_id, "price": t.price,
+                 "quantity": t.quantity, "filled": False}
+                for t in tiers
+            ]
+            extra["runner_order_id"] = runner_id
+            extra["runner_activation_price"] = plan.runner_activation_price
+            extra["runner_callback_rate"] = plan.runner_callback_rate
+            extra["tiers_filled"] = 0
+            extra["runner_active"] = False
+        else:
+            # Remainder too small to re-ladder; the marching stop alone protects it.
+            extra["tier_orders"] = []
+            extra["runner_order_id"] = None
+        extra["time_partial_done"] = True
+        extra["remaining_quantity"] = new_remaining
+        # Re-baseline the cross-check against the reshaped position.
+        extra["ladder_base_quantity"] = new_remaining
+        await self._risk_event(
+            db, "info", "ladder_time_partial",
+            f"{trade.symbol} 15-min partial: closed {close_qty}, remaining {new_remaining}",
+            {"trade_id": trade.id, "symbol": trade.symbol, "closed_qty": close_qty,
+             "remaining": new_remaining, "pnl": round(pnl, 6), "re_laddered": re_laddered},
+        )
+
+    async def _ladder_time_full_exit(
+        self, db: AsyncSession, adapter: ExchangeAdapter, manager: OrderManager,
+        trade: Trade, extra: dict, position: Position, mark: float,
+    ) -> None:
+        """45-minute hard exit: cancel ALL remaining ladder orders and market-close
+        the whole remaining position."""
+        tier_ids = [t.get("order_id") for t in (extra.get("tier_orders") or []) if not t.get("filled")]
+        await manager.cancel_orders(
+            trade.symbol, [extra.get("stop_order_id"), extra.get("runner_order_id"), *tier_ids],
+        )
+        await self._send_reduce_only(adapter, trade, float(position.quantity))
+        trade.quantity = float(position.quantity)
+        extra["ladder_active"] = False
+        trade.extra = extra
+        await self._finalize_trade_close(db, trade, mark, "time_exit_full")
+        await self._risk_event(
+            db, "info", "ladder_time_full",
+            f"{trade.symbol} 45-min full time exit",
+            {"trade_id": trade.id, "symbol": trade.symbol, "mark": mark},
+        )
+        await self._ladder_record_closed(db, trade, "time_exit_full")
+
+    async def _ladder_record_closed(self, db: AsyncSession, trade: Trade, reason: str) -> None:
+        """Emit the audit event that operationalizes the 150-trade success metric:
+        one fully-closed ladder position == one event with counts_toward_150=True."""
+        await self._risk_event(
+            db, "info", "ladder_trade_closed",
+            f"{trade.symbol} ladder position fully closed: {reason}",
+            {"trade_id": trade.id, "symbol": trade.symbol, "reason": reason,
+             "realized_pnl": round(float(trade.realized_pnl or 0.0), 6),
+             "ladder_mode": (trade.extra or {}).get("ladder_mode"),
+             "counts_toward_150": True},
+        )
 
     async def _sync_paper_simulator_trades(
         self, db: AsyncSession, adapter: ExchangeAdapter, trades: list[Trade]

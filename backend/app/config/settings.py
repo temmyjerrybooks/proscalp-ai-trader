@@ -197,6 +197,24 @@ class Settings(BaseSettings):
     protective_orders_failure_threshold: int = 3
     protective_orders_failure_window_hours: int = 1
 
+    # Phase 2B Branch 2 — full exit ladder. Gated under exchange_resting_exits_enabled.
+    # Two-step rollout: enable exchange_resting_exits_enabled first (single-TP path),
+    # then five_tier_ladder_enabled (full ladder). NEVER ladder-on while resting-off
+    # (a startup consistency check disables the ladder if that combination is detected).
+    five_tier_ladder_enabled: bool = False
+    tp_tier_atr_multipliers: list[float] = Field(default_factory=lambda: [0.3, 0.6, 1.0, 1.6])
+    tp_tier_size_pct: list[float] = Field(default_factory=lambda: [0.2, 0.2, 0.2, 0.2])
+    tp_tier_min_notional_usdt: float = 5.0
+    be_plus_activation_atr_mult: float = 0.5
+    be_plus_offset_bps: float = 20.0
+    stop_ladder_pct: list[float] = Field(default_factory=lambda: [0.0, 0.002, 0.005, 0.010])
+    runner_trail_atr_mult: float = 0.55
+    runner_trail_callback_clamp: list[float] = Field(default_factory=lambda: [0.1, 10.0])
+    time_exit_partial_minutes: int = 15
+    time_exit_partial_pct: float = 0.5
+    time_exit_full_minutes: int = 45
+    slippage_anomaly_bps: float = 30.0
+
     @field_validator("max_concurrent_trades")
     @classmethod
     def clamp_concurrency(cls, value: int) -> int:
