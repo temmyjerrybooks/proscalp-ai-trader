@@ -134,6 +134,39 @@ async def test_two_tiers_filled_books_pnl_and_advances_stop():
     assert "ladder_tier_filled" in et
     assert "ladder_be_plus_armed" in et
     assert "ladder_stop_advanced" in et
+    # exchange qty (0.6) matches the filled-tier accounting (1.0 - 0.4) -> no anomaly
+    assert "ladder_sync_anomaly" not in et
+
+
+@pytest.mark.asyncio
+async def test_sync_anomaly_fires_when_exchange_qty_inconsistent():
+    runner = _runner()
+    trade = _ladder_trade(qty=1.0)  # entry 1.0; original_quantity baseline = 1.0
+    # tp1 left the book (detected filled) BUT the exchange still reports the FULL
+    # 1.0 position -> filled accounting (expect 0.8 remaining) disagrees by 20%.
+    adapter = FakeExchange(
+        positions=[Position("BTCUSDT", "long", 1.0, 1000.0, mark_price=1004.0)],
+        open_order_ids={"tp2", "tp3", "tp4", "run1", "sl1"},
+        order_fills={"tp1": 1003.0},
+    )
+    await runner._sync_ladder_trades(_db(), adapter, [trade])
+
+    et = _event_types(runner)
+    # detection STILL proceeds: tier booked despite the anomaly
+    assert trade.extra["tier_orders"][0]["filled"] is True
+    assert trade.realized_pnl > 0
+    assert "ladder_tier_filled" in et
+    # and the observational tripwire fired with the diagnostic payload
+    assert "ladder_sync_anomaly" in et
+    payload = next(c.args[4] for c in runner._risk_event.await_args_list
+                   if c.args[2] == "ladder_sync_anomaly")
+    assert payload["tiers"] == [1]
+    assert payload["exchange_quantity"] == 1.0
+    assert payload["expected_remaining"] == pytest.approx(0.8)
+    assert payload["fetch_order_status"] == {1: "filled"}
+    assert payload["filled_tier_quantities"] == pytest.approx(0.2)
+    assert payload["drift_pct"] == pytest.approx(20.0)
+    assert "timestamp" in payload
 
 
 @pytest.mark.asyncio

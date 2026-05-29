@@ -1070,6 +1070,9 @@ class BotRunner:
             extra["time_partial_done"] = False
             extra["original_quantity"] = trade.quantity
             extra["remaining_quantity"] = trade.quantity
+            # Baseline for the tier-fill cross-check anomaly. Reset on the 15-min
+            # re-ladder so the partial time-exit's own bookkeeping never trips it.
+            extra["ladder_base_quantity"] = trade.quantity
             await self._risk_event(
                 db, "info", "ladder_attached",
                 f"{signal.symbol} {result.mode} ladder: {len(result.tier_orders)} tiers, "
@@ -1425,22 +1428,32 @@ class BotRunner:
         except Exception as exc:
             logger.warning("sync_ladder_fetch_orders_failed", symbol=trade.symbol, error=str(exc))
             return
+        # Cross-check baseline: the entry quantity of the *current* ladder (reset on
+        # the 15-min re-ladder). Running tally of filled tier quantity, seeded with
+        # tiers already booked in prior cycles.
+        base_qty = float(extra.get("ladder_base_quantity") or extra.get("original_quantity") or trade.quantity)
+        filled_qty = sum(float(t["quantity"]) for t in tier_orders if t.get("filled"))
+        newly_filled: list[tuple[dict, str]] = []  # (tier, fetch_order_status)
         for tier in unfilled:
             if tier["order_id"] in open_ids:
                 continue  # still resting
             # No longer on the book -> treat as filled. Attribute the actual fill
             # price when the adapter can report it; otherwise use the tier trigger.
             fill_price = float(tier["price"])
+            order_status = "unknown"
             try:
                 order = await adapter.fetch_order(trade.symbol, tier["order_id"])
-                if order.status.lower() == "filled" and (order.average_price or 0) > 0:
+                order_status = order.status.lower()
+                if order_status == "filled" and (order.average_price or 0) > 0:
                     fill_price = float(order.average_price)
             except NotImplementedError:
-                pass
+                order_status = "fetch_order_unsupported"
             except Exception as exc:
                 logger.debug("ladder_tier_fetch_failed", symbol=trade.symbol, error=str(exc))
             tier["filled"] = True
             tier["fill_price"] = fill_price
+            filled_qty += float(tier["quantity"])
+            newly_filled.append((tier, order_status))
             pnl = self._exit_pnl(trade, fill_price, float(tier["quantity"]))
             trade.realized_pnl = float(trade.realized_pnl or 0.0) + pnl
             await self._risk_event(
@@ -1461,6 +1474,50 @@ class BotRunner:
                      "threshold_bps": self.settings.slippage_anomaly_bps},
                 )
         extra["tier_orders"] = tier_orders
+        # Observational cross-check: run ONCE per cycle after all this cycle's fills
+        # are booked. The exchange position reflects fills cumulatively, so checking
+        # per-tier would false-positive whenever >1 tier fills in a single poll.
+        if newly_filled:
+            await self._ladder_sync_crosscheck(db, adapter, trade, newly_filled, base_qty, filled_qty)
+
+    async def _ladder_sync_crosscheck(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trade: Trade,
+        newly_filled: list[tuple[dict, str]], base_qty: float, filled_qty_to_date: float,
+    ) -> None:
+        """Observational tripwire for the cancel-vs-fill / no-cross-check tradeoffs.
+
+        After this cycle's tier fills are booked, compare the live exchange position
+        quantity against the filled-tier accounting. If they diverge by more than 5%
+        of the ladder's base quantity, emit a `ladder_sync_anomaly` RiskEvent. This
+        NEVER aborts detection — it is purely empirical evidence of whether the
+        detection heuristic ever misfires in practice (target: zero anomalies over
+        50+ trades). The extra fetch_positions call only happens on an actual fill.
+        """
+        if base_qty <= 0:
+            return
+        try:
+            positions = await adapter.fetch_positions()
+            exchange_qty = next((float(p.quantity) for p in positions if p.symbol == trade.symbol), 0.0)
+        except Exception as exc:
+            logger.debug("ladder_crosscheck_fetch_failed", symbol=trade.symbol, error=str(exc))
+            return  # could not read position this cycle; observational only
+        expected_remaining = base_qty - filled_qty_to_date
+        drift = abs(exchange_qty - expected_remaining) / base_qty
+        if drift > 0.05:
+            tiers = [t["index"] for t, _ in newly_filled]
+            statuses = {t["index"]: status for t, status in newly_filled}
+            await self._risk_event(
+                db, "warning", "ladder_sync_anomaly",
+                f"{trade.symbol} tiers {tiers} sync drift {drift * 100:.1f}%: "
+                f"exchange_qty={exchange_qty} expected_remaining={expected_remaining}",
+                {"trade_id": trade.id, "symbol": trade.symbol, "tiers": tiers,
+                 "exchange_quantity": exchange_qty, "expected_remaining": expected_remaining,
+                 "fetch_order_status": statuses,
+                 "filled_tier_quantities": round(filled_qty_to_date, 10),
+                 "ladder_base_quantity": base_qty,
+                 "drift_pct": round(drift * 100, 2),
+                 "timestamp": utc_now().isoformat()},
+            )
 
     async def _finalize_ladder_close(
         self, db: AsyncSession, adapter: ExchangeAdapter, manager: OrderManager,
@@ -1539,6 +1596,8 @@ class BotRunner:
             extra["runner_order_id"] = None
         extra["time_partial_done"] = True
         extra["remaining_quantity"] = new_remaining
+        # Re-baseline the cross-check against the reshaped position.
+        extra["ladder_base_quantity"] = new_remaining
         await self._risk_event(
             db, "info", "ladder_time_partial",
             f"{trade.symbol} 15-min partial: closed {close_qty}, remaining {new_remaining}",
