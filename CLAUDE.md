@@ -74,7 +74,7 @@ Production image: `proscalp-ai-trader-backend:latest`, built from [backend/Docke
 
 **Containers (docker compose):** `postgres`, `backend`, `frontend`, `nginx`.
 - **Only `backend` is restarted for code deploys.** Never touch the other three.
-- **Use `docker compose up -d --no-deps backend`.** Without `--no-deps`, compose follows the `depends_on: postgres: service_healthy` chain and **recreates postgres** as a side effect. Data survives via the named `postgres_data` volume, but it's unnecessary churn and violates the "only-backend" rule. (Lesson from Phase 2A deploy.)
+- **Use `docker compose up -d --no-deps --build backend`.** `--no-deps`: without it, compose follows the `depends_on: postgres: service_healthy` chain and **recreates postgres** as a side effect (unnecessary churn; violates the "only-backend" rule — data survives via the named `postgres_data` volume, but don't). **`--build` is required**: the backend image bakes the app via Dockerfile `COPY app ./app` (it is **not** a runtime bind-mount — only `data`/`logs` are mounted), so rsync'd code only takes effect via an image rebuild. Without `--build`, compose restarts the **existing** image and **silently no-ops the deploy** (you'd be running old code while believing the deploy succeeded). Verify post-deploy by hashing files *inside* the running container. (Lessons from Phase 2A + Branch 2 deploys.)
 
 **DB raw-SQL gotcha:** `trades.extra` maps to column literally named `metadata`. Use `trades.metadata->>'grade'`.
 
