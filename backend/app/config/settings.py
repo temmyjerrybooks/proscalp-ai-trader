@@ -176,7 +176,7 @@ class Settings(BaseSettings):
 
     # Phase 2B Branch 1 — foundation (exchange-resting exits, measurement, sim wiring).
     # All trading-impact flags default OFF for gated rollout; measurement-only flags default ON.
-    exchange_resting_exits_enabled: bool = False
+    exchange_resting_exits_enabled: bool = True  # ACTIVATED 2026-05-30 (first of two-step Branch 2 activation; ladder still gated)
     mfe_mae_logging_enabled: bool = True
     paper_sim_wired_to_live_loop: bool = False
     shadow_replay_fee_aware: bool = True
