@@ -167,6 +167,10 @@ Default report length at STOP markers: **under 300 words.** Append detail only w
 - **Two grade systems** — reconcile to one to eliminate analysis confusion.
 - **Indicator warm-up windows** — EMA200 on 120 candles is dominated by the seed; EMA50 marginal; leader `EMA21` at depth 80 under-warmed; VWAP is not session-anchored.
 
+## Known Follow-ups (deferred to Phase 2C)
+
+- **`close_all_positions` / emergency paths do not cancel algo orders** (ref: investigation in commit `c527bd3`). They cancel only *regular* `/fapi/v1/order` open orders; the resting protective/ladder orders are now algo orders (`/fapi/v1/algoOrder`). Financially harmless once the position is flat — a `closePosition`/`reduceOnly` algo order can't fill against zero exposure — but the leftover orders **count against Binance's per-symbol algo-order cap** until they expire/are cleared, which can block re-entry on that symbol. **Pre-mainnet requirement (hard gate):** `close_all_positions` (and `emergency_stop`) must cancel algo orders alongside regular orders via `fetch_open_algo_orders` + `cancel_algo_order` **before any mainnet deployment is considered.** Acceptable to leave on testnet.
+
 ---
 
-Last updated: 2026-05-23 after Phase 2A merge
+Last updated: 2026-05-30 after Phase 2B adapter algo-fix implementation
