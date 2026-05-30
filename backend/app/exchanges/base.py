@@ -199,6 +199,33 @@ class ExchangeAdapter(ABC):
         """
         raise NotImplementedError(f"{self.name} adapter does not implement fetch_order")
 
+    # ----- Phase 2B adapter remediation: Binance Algo Order endpoints -----
+    # Effective 2025-12-09 Binance migrated conditional order types
+    # (STOP_MARKET / TAKE_PROFIT_MARKET / TRAILING_STOP_MARKET) off /fapi/v1/order
+    # to the Algo Service (/fapi/v1/algoOrder). The standard order endpoint now
+    # rejects them with -4120. Entry orders (market/limit) still use place_order.
+    # Adapters that place conditional/protective orders must implement these.
+
+    async def place_algo_order(self, request: OrderRequest) -> OrderResult:
+        """Place a conditional algo order (STOP_MARKET / TAKE_PROFIT_MARKET /
+        TRAILING_STOP_MARKET) via the Algo Order API. Returns an OrderResult whose
+        ``order_id`` is the normalized algoId, so callers never see the
+        algoId/orderId distinction at the type level."""
+        raise NotImplementedError(f"{self.name} adapter does not implement place_algo_order")
+
+    async def cancel_algo_order(self, symbol: str, algo_id: str) -> OrderResult:
+        """Cancel an algo order by id. Success is determined by HTTP status (2xx),
+        not the response body (the testnet returns a null status on DELETE)."""
+        raise NotImplementedError(f"{self.name} adapter does not implement cancel_algo_order")
+
+    async def fetch_algo_order(self, symbol: str, algo_id: str) -> OrderResult:
+        """Query one algo order by id (status / fill attribution)."""
+        raise NotImplementedError(f"{self.name} adapter does not implement fetch_algo_order")
+
+    async def fetch_open_algo_orders(self, symbol: str | None = None) -> list[OrderResult]:
+        """List currently-open algo orders (for tier-fill detection + reconciliation)."""
+        raise NotImplementedError(f"{self.name} adapter does not implement fetch_open_algo_orders")
+
     async def get_fees(self, symbol: str) -> dict[str, float]:
         return {"maker_bps": 2.0, "taker_bps": 6.0}
 

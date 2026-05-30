@@ -217,7 +217,7 @@ class BotRunner:
         try:
             db_trades = await self._open_database_trades(db)
             exchange_positions = await adapter.fetch_positions()
-            exchange_orders = await adapter.fetch_open_orders()
+            exchange_orders = await adapter.fetch_open_algo_orders()
         except Exception as exc:
             logger.error("startup_reconciliation_fetch_failed", error=str(exc))
             return
@@ -225,8 +225,10 @@ class BotRunner:
         position_symbols = {p.symbol for p in exchange_positions}
         protective_by_symbol: dict[str, list] = {}
         for order in exchange_orders:
-            cid = str((order.raw or {}).get("clientOrderId", ""))
-            if cid.startswith("proscalp-sl-") or cid.startswith("proscalp-tp-"):
+            # Protective/ladder orders are algo orders; identified by the clientAlgoId
+            # 'proscalp-' prefix. Foreign algo orders never match and are never touched.
+            cid = str((order.raw or {}).get("clientAlgoId", ""))
+            if cid.startswith("proscalp-"):
                 protective_by_symbol.setdefault(order.symbol, []).append(order)
         db_open_symbols = {t.symbol for t in db_trades}
 
@@ -294,12 +296,12 @@ class BotRunner:
                 continue
             for order in orders:
                 try:
-                    await adapter.cancel_order(symbol, order.order_id)
+                    await adapter.cancel_algo_order(symbol, order.order_id)
                     orphan_cancelled += 1
                     logger.info(
                         "orphan_orders_cancelled",
                         symbol=symbol, order_id=order.order_id,
-                        client_order_id=(order.raw or {}).get("clientOrderId"),
+                        client_order_id=(order.raw or {}).get("clientAlgoId"),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -315,14 +317,17 @@ class BotRunner:
         await db.commit()
 
     async def _startup_adapter_test(self, adapter: ExchangeAdapter) -> None:
-        """Phase 2B Branch 1: catch adapter implementation bugs before they affect real positions.
+        """Phase 2B (algo remediation): catch adapter bugs before they affect real positions.
 
-        Posts a far-from-market STOP_MARKET (closePosition=True) on BTCUSDT and
-        immediately cancels it. The stopPrice is at mid * 0.5 — would only trigger
-        on a 50% drop in seconds, so it cannot fill during the placement window.
-        Logs success/failure but does not block the main loop from starting
-        (degraded path: if exchange-resting is broken, regular signals will
-        surface the same error and fall back to legacy polling).
+        Runs the FULL algo-order lifecycle against the live exchange on BTCUSDT:
+        place a far-from-market conditional STOP_MARKET via the Algo Order API ->
+        GET to confirm it rested -> cancel -> GET to confirm it's gone. The trigger
+        sits at mid * 0.5, so it cannot fill in the window. Unlike production cancels
+        (which trust HTTP 2xx — see cancel_algo_order), this verification path does a
+        confirmation GET *after* cancel because its whole job is to prove the round
+        trip end-to-end. A quantity order (sized for min-notional) is used rather than
+        closePosition, since startup usually runs with no BTC position. Logs loudly on
+        failure but never blocks startup (degraded path falls back to legacy polling).
         """
         symbol = "BTCUSDT"
         try:
@@ -330,22 +335,27 @@ class BotRunner:
             mark = book.mid_price
             if mark <= 0:
                 raise ValueError("mid price not available")
+            rules = await adapter.fetch_symbol_rules(symbol)  # type: ignore[attr-defined]
         except Exception as exc:
-            logger.warning("startup_adapter_test_skip", reason=f"book fetch failed: {exc}")
+            logger.warning("startup_adapter_test_skip", reason=f"book/rules fetch failed: {exc}")
             return
 
+        trigger = mark * 0.5  # far below market; cannot trigger in the placement window
+        # Notional is valued at the trigger for a conditional market order; size for
+        # min-notional there (with buffer) so the probe order isn't rejected (-4164).
+        quantity = max(float(rules["min_qty"]), (float(rules["min_notional"]) * 1.15) / trigger)
         request = OrderRequest(
             symbol=symbol,
             side="sell",
             order_type="stop_market",
-            stop_price=mark * 0.5,  # far below market; cannot trigger in the placement window
-            close_position=True,
+            stop_price=trigger,
+            quantity=quantity,
             working_type="MARK_PRICE",
-            client_order_id=f"proscalp-test-{uuid4().hex[:18]}",
+            client_order_id=self._algo_client_id("startup", "test"),
         )
         start = _time.perf_counter()
         try:
-            result = await adapter.place_order(request)
+            result = await adapter.place_algo_order(request)
         except Exception as exc:
             elapsed_ms = (_time.perf_counter() - start) * 1000.0
             logger.error(
@@ -355,17 +365,31 @@ class BotRunner:
             return
 
         try:
-            await adapter.cancel_order(symbol, result.order_id)
-            elapsed_ms = (_time.perf_counter() - start) * 1000.0
-            logger.info(
-                "startup_adapter_test_ok",
-                order_id=result.order_id, elapsed_ms=round(elapsed_ms, 1),
-            )
+            placed = await adapter.fetch_algo_order(symbol, result.order_id)
+            logger.info("startup_adapter_test_placed", order_id=result.order_id, status=placed.status)
         except Exception as exc:
-            logger.warning(
-                "startup_adapter_test_cancel_failed",
-                order_id=result.order_id, error=str(exc),
-            )
+            logger.warning("startup_adapter_test_get_failed", stage="get_after_place",
+                           order_id=result.order_id, error=str(exc))
+
+        try:
+            await adapter.cancel_algo_order(symbol, result.order_id)
+        except Exception as exc:
+            logger.error("startup_adapter_test_failed", stage="cancel",
+                         order_id=result.order_id, error=str(exc))
+            return
+
+        # Confirmation GET (verification path only — production cancels skip this).
+        confirmed = "unconfirmed"
+        try:
+            after = await adapter.fetch_algo_order(symbol, result.order_id)
+            confirmed = after.status
+        except Exception:
+            confirmed = "gone"  # a 4xx GET on a cancelled order is an acceptable "gone"
+        elapsed_ms = (_time.perf_counter() - start) * 1000.0
+        logger.info(
+            "startup_adapter_test_ok",
+            order_id=result.order_id, cancel_confirmed=confirmed, elapsed_ms=round(elapsed_ms, 1),
+        )
 
     async def stop(self) -> BotRuntimeStatus:
         self.status.enabled = False
@@ -1377,7 +1401,7 @@ class BotRunner:
         if advance.new_stop_price is not None:
             old_stop_id = extra.get("stop_order_id")
             new_id, issues = await manager.advance_ladder_stop(
-                trade.symbol, trade.side, advance.new_stop_price, old_stop_id,
+                trade.symbol, trade.side, advance.new_stop_price, old_stop_id, trade.id,
             )
             if new_id:
                 extra["stop_order_id"] = new_id
@@ -1424,7 +1448,7 @@ class BotRunner:
         if not unfilled:
             return
         try:
-            open_ids = {o.order_id for o in await adapter.fetch_open_orders(trade.symbol)}
+            open_ids = {o.order_id for o in await adapter.fetch_open_algo_orders(trade.symbol)}
         except Exception as exc:
             logger.warning("sync_ladder_fetch_orders_failed", symbol=trade.symbol, error=str(exc))
             return
@@ -1442,12 +1466,12 @@ class BotRunner:
             fill_price = float(tier["price"])
             order_status = "unknown"
             try:
-                order = await adapter.fetch_order(trade.symbol, tier["order_id"])
+                order = await adapter.fetch_algo_order(trade.symbol, tier["order_id"])
                 order_status = order.status.lower()
-                if order_status == "filled" and (order.average_price or 0) > 0:
+                if order_status in ("filled", "triggered") and (order.average_price or 0) > 0:
                     fill_price = float(order.average_price)
             except NotImplementedError:
-                order_status = "fetch_order_unsupported"
+                order_status = "fetch_algo_order_unsupported"
             except Exception as exc:
                 logger.debug("ladder_tier_fetch_failed", symbol=trade.symbol, error=str(exc))
             tier["filled"] = True
@@ -1704,12 +1728,12 @@ class BotRunner:
             if not order_id:
                 continue
             try:
-                order = await adapter.fetch_order(symbol, order_id)
+                order = await adapter.fetch_algo_order(symbol, order_id)
             except NotImplementedError:
                 return 0.0, ""
             except Exception:
                 continue
-            if order.status.lower() == "filled" and (order.average_price or 0) > 0:
+            if order.status.lower() in ("filled", "triggered") and (order.average_price or 0) > 0:
                 return float(order.average_price), reason
         return 0.0, ""
 

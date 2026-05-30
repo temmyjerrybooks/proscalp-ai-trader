@@ -71,6 +71,14 @@ class FakeExchange(ExchangeAdapter):
         self.cancelled.append((symbol, order_id))
         return OrderResult(order_id, symbol, "canceled", "sell", "stop_market", 0)
 
+    # Protective orders are conditional -> algo endpoints. Delegate to the same
+    # recording logic so existing assertions on the OrderRequest still hold.
+    async def place_algo_order(self, request):
+        return await self.place_order(request)
+
+    async def cancel_algo_order(self, symbol, order_id):
+        return await self.cancel_order(symbol, order_id)
+
 
 def _mk_manager(*, slow_ms: int | None = None, **fake_kw) -> tuple[OrderManager, FakeExchange]:
     settings_kw = {"trading_mode": TradingMode.TESTNET}

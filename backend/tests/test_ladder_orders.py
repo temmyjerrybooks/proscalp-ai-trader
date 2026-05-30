@@ -59,6 +59,13 @@ class FakeExchange(ExchangeAdapter):
         self.cancelled.append((symbol, order_id))
         return OrderResult(order_id, symbol, "canceled", "sell", "stop_market", 0)
 
+    # Ladder orders are conditional -> algo endpoints; delegate to the same recorder.
+    async def place_algo_order(self, request):
+        return await self.place_order(request)
+
+    async def cancel_algo_order(self, symbol, order_id):
+        return await self.cancel_order(symbol, order_id)
+
 
 def _manager(exch):
     return OrderManager(exch, settings=Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
@@ -135,7 +142,7 @@ async def test_attach_runner_failure_keeps_ladder_active():
 async def test_advance_stop_places_new_before_cancelling_old():
     exch = FakeExchange()
     mgr = _manager(exch)
-    new_id, issues = await mgr.advance_ladder_stop("BTCUSDT", "long", 1005.0, "old-stop-1")
+    new_id, issues = await mgr.advance_ladder_stop("BTCUSDT", "long", 1005.0, "old-stop-1", "t1")
     assert new_id == "o1"
     assert issues == []
     # The NEW stop is placed BEFORE the old one is cancelled (never unprotected).
@@ -146,7 +153,7 @@ async def test_advance_stop_places_new_before_cancelling_old():
 @pytest.mark.asyncio
 async def test_advance_stop_placement_failure_leaves_old_in_place():
     exch = FakeExchange(fail_on_types=["stop_market"])
-    new_id, issues = await _manager(exch).advance_ladder_stop("BTCUSDT", "long", 1005.0, "old-stop-1")
+    new_id, issues = await _manager(exch).advance_ladder_stop("BTCUSDT", "long", 1005.0, "old-stop-1", "t1")
     assert new_id is None
     assert exch.cancelled == []  # old stop NOT cancelled when the new one fails
     assert issues and "placement failed" in issues[0]
