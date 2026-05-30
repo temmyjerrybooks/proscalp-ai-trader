@@ -29,10 +29,11 @@ def _trade(*, id: str, symbol: str, stop_id: str | None = None, tp_id: str | Non
 
 
 def _order(order_id: str, symbol: str, client_order_id: str) -> OrderResult:
+    # Protective orders are algo orders; reconciliation matches on clientAlgoId.
     return OrderResult(
         order_id=order_id, symbol=symbol, status="new",
         side="sell", order_type="stop_market", quantity=0.0,
-        raw={"clientOrderId": client_order_id},
+        raw={"clientAlgoId": client_order_id},
     )
 
 
@@ -50,7 +51,10 @@ class FakeExchange(ExchangeAdapter):
     async def cancel_order(self, symbol, order_id):
         self.cancelled.append((symbol, order_id))
         return OrderResult(order_id, symbol, "canceled", "sell", "stop_market", 0)
+    async def cancel_algo_order(self, symbol, order_id):
+        return await self.cancel_order(symbol, order_id)
     async def fetch_open_orders(self, symbol=None): return list(self._open_orders)
+    async def fetch_open_algo_orders(self, symbol=None): return list(self._open_orders)
     async def fetch_positions(self): return list(self._positions)
     async def close_position(self, symbol): return OrderResult("0", symbol, "filled", "sell", "market", 0)
     async def set_leverage(self, symbol, leverage): return True

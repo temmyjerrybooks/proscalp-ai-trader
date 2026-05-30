@@ -54,6 +54,19 @@ class FakeExchange(ExchangeAdapter):
         return OrderResult(order_id, symbol, "filled" if avg else "new", "sell",
                            "take_profit_market", 0.2, average_price=avg or None)
 
+    # Ladder lifecycle runs on algo endpoints; delegate to the regular fakes.
+    async def fetch_open_algo_orders(self, symbol=None):
+        return await self.fetch_open_orders(symbol)
+
+    async def fetch_algo_order(self, symbol, order_id):
+        return await self.fetch_order(symbol, order_id)
+
+    async def place_algo_order(self, request):
+        return await self.place_order(request)
+
+    async def cancel_algo_order(self, symbol, order_id):
+        return await self.cancel_order(symbol, order_id)
+
     async def place_order(self, request):
         self._n += 1
         self.placed.append(request)

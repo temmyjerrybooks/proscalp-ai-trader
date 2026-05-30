@@ -173,6 +173,18 @@ class OrderManager:
     def _book_is_usable(book: OrderBook) -> bool:
         return book.best_bid > 0 and book.best_ask > 0 and book.best_ask >= book.best_bid
 
+    @staticmethod
+    def _algo_client_id(trade_id: str, role: str) -> str:
+        """Stable, traceable clientAlgoId for a protective/ladder order.
+
+        Pattern: ``proscalp-{trade8}-{role}-{nonce}`` (role ∈ stop|tp|tp1..tp4|
+        runner|test). The trade id is truncated to 10 hex chars to stay within
+        Binance's clientId length limit while remaining traceable back to the
+        source trade for reconciliation + incident analysis. The ``proscalp-``
+        prefix is how reconciliation distinguishes our orders from foreign ones."""
+        short = (trade_id or "").replace("-", "")[:10]
+        return f"proscalp-{short}-{role}-{uuid4().hex[:4]}"
+
     async def cancel_and_replace(
         self,
         symbol: str,
@@ -211,6 +223,7 @@ class OrderManager:
         take_profit_order_id: str | None = None
 
         # 1) Stop loss first — protects against the most damaging direction.
+        #    Conditional types now route to the Algo Order API (Binance migration).
         stop_request = OrderRequest(
             symbol=signal.symbol,
             side=side,  # type: ignore[arg-type]
@@ -218,10 +231,10 @@ class OrderManager:
             stop_price=signal.stop_loss,
             close_position=True,
             working_type=working_type,
-            client_order_id=f"proscalp-sl-{uuid4().hex[:18]}",
+            client_order_id=self._algo_client_id(trade_id, "stop"),
         )
         try:
-            stop_result = await self.adapter.place_order(stop_request)
+            stop_result = await self.adapter.place_algo_order(stop_request)
             stop_order_id = stop_result.order_id
         except Exception as exc:
             reasons.append(f"stop_market placement failed: {exc}")
@@ -240,10 +253,10 @@ class OrderManager:
                 stop_price=final_tp,
                 close_position=True,
                 working_type=working_type,
-                client_order_id=f"proscalp-tp-{uuid4().hex[:18]}",
+                client_order_id=self._algo_client_id(trade_id, "tp"),
             )
             try:
-                tp_result = await self.adapter.place_order(tp_request)
+                tp_result = await self.adapter.place_algo_order(tp_request)
                 take_profit_order_id = tp_result.order_id
             except Exception as exc:
                 reasons.append(f"take_profit_market placement failed: {exc}")
@@ -291,7 +304,7 @@ class OrderManager:
             if not order_id:
                 continue
             try:
-                await self.adapter.cancel_order(symbol, order_id)
+                await self.adapter.cancel_algo_order(symbol, order_id)
             except Exception as exc:
                 issues.append(f"{label} {order_id}: {exc}")
         return issues
@@ -371,10 +384,10 @@ class OrderManager:
             stop_price=plan.stop_price,
             close_position=True,
             working_type=working_type,
-            client_order_id=f"proscalp-sl-{uuid4().hex[:18]}",
+            client_order_id=self._algo_client_id(trade_id, "stop"),
         )
         try:
-            stop_result = await self.adapter.place_order(stop_request)
+            stop_result = await self.adapter.place_algo_order(stop_request)
             stop_order_id = stop_result.order_id
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -430,7 +443,7 @@ class OrderManager:
         reasons: list[str] = []
         for tier in plan.tiers:
             try:
-                tp_result = await self.adapter.place_order(
+                tp_result = await self.adapter.place_algo_order(
                     OrderRequest(
                         symbol=symbol,
                         side=exit_side,  # type: ignore[arg-type]
@@ -439,7 +452,7 @@ class OrderManager:
                         stop_price=tier.price,
                         reduce_only=True,
                         working_type=working_type,
-                        client_order_id=f"proscalp-tp{tier.index}-{uuid4().hex[:14]}",
+                        client_order_id=self._algo_client_id(trade_id, f"tp{tier.index}"),
                     )
                 )
                 tier_orders.append(
@@ -453,7 +466,7 @@ class OrderManager:
 
         if plan.runner_quantity > 0 and plan.runner_callback_rate is not None:
             try:
-                runner_result = await self.adapter.place_order(
+                runner_result = await self.adapter.place_algo_order(
                     OrderRequest(
                         symbol=symbol,
                         side=exit_side,  # type: ignore[arg-type]
@@ -463,7 +476,7 @@ class OrderManager:
                         activation_price=plan.runner_activation_price,
                         reduce_only=True,
                         working_type=working_type,
-                        client_order_id=f"proscalp-run-{uuid4().hex[:14]}",
+                        client_order_id=self._algo_client_id(trade_id, "runner"),
                     )
                 )
                 runner_order_id = runner_result.order_id
@@ -493,11 +506,12 @@ class OrderManager:
         direction: str,
         new_stop_price: float,
         old_stop_order_id: str | None,
+        trade_id: str,
         *,
         working_type: WorkingType = "MARK_PRICE",
     ) -> tuple[str | None, list[str]]:
-        """Ratchet the marching stop up. Place the NEW stop first, then cancel the
-        old one (a brief two-stop overlap is safe — both are closePosition — and
+        """Ratchet the marching stop up. Place the NEW algo stop first, then cancel
+        the old one (a brief two-stop overlap is safe — both are closePosition — and
         guarantees the position is never momentarily unprotected).
 
         Returns (new_stop_order_id, issues). On placement failure the old stop is
@@ -506,7 +520,7 @@ class OrderManager:
         exit_side = "sell" if direction == "long" else "buy"
         issues: list[str] = []
         try:
-            new_result = await self.adapter.place_order(
+            new_result = await self.adapter.place_algo_order(
                 OrderRequest(
                     symbol=symbol,
                     side=exit_side,  # type: ignore[arg-type]
@@ -514,7 +528,7 @@ class OrderManager:
                     stop_price=new_stop_price,
                     close_position=True,
                     working_type=working_type,
-                    client_order_id=f"proscalp-sl-{uuid4().hex[:18]}",
+                    client_order_id=self._algo_client_id(trade_id, "stop"),
                 )
             )
         except Exception as exc:
@@ -523,19 +537,19 @@ class OrderManager:
 
         if old_stop_order_id:
             try:
-                await self.adapter.cancel_order(symbol, old_stop_order_id)
+                await self.adapter.cancel_algo_order(symbol, old_stop_order_id)
             except Exception as exc:
                 issues.append(f"old stop {old_stop_order_id} cancel failed: {exc}")
         return new_result.order_id, issues
 
     async def cancel_orders(self, symbol: str, order_ids: list[str | None]) -> list[str]:
-        """Cancel a batch of orders, capturing (never raising) per-order failures."""
+        """Cancel a batch of algo orders, capturing (never raising) per-order failures."""
         issues: list[str] = []
         for order_id in order_ids:
             if not order_id:
                 continue
             try:
-                await self.adapter.cancel_order(symbol, order_id)
+                await self.adapter.cancel_algo_order(symbol, order_id)
             except Exception as exc:
                 issues.append(f"{order_id}: {exc}")
         return issues

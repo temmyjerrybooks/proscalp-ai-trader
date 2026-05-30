@@ -185,18 +185,19 @@ class BinanceAdapter(ExchangeAdapter):
         ]
 
     async def place_order(self, request: OrderRequest) -> OrderResult:
+        # Entry path only. Conditional types (STOP_MARKET / TAKE_PROFIT_MARKET /
+        # TRAILING_STOP_MARKET) migrated to the Algo Order API (Binance 2025-12-09);
+        # /fapi/v1/order rejects them with -4120. Guard so they can never be sent here
+        # by accident — callers must use place_algo_order.
+        if request.order_type in ("stop_market", "take_profit_market", "trailing_stop_market"):
+            raise ValueError(
+                f"{request.order_type} is a conditional order — use place_algo_order "
+                "(/fapi/v1/order rejects it with -4120 since the 2025-12-09 migration)"
+            )
         rules = await self.fetch_symbol_rules(request.symbol)
-        is_trailing = request.order_type == "trailing_stop_market"
-        is_protective = request.order_type in ("stop_market", "take_profit_market")
-        is_whole_position = is_protective and request.close_position
-
-        quantity = request.quantity
-        if not is_whole_position:
-            quantity = self._round_quantity(quantity, rules, request.order_type)
-            if quantity < rules["min_qty"]:
-                raise ValueError(
-                    f"{request.symbol} quantity is below minimum after exchange rounding"
-                )
+        quantity = self._round_quantity(request.quantity, rules, request.order_type)
+        if quantity < rules["min_qty"]:
+            raise ValueError(f"{request.symbol} quantity is below minimum after exchange rounding")
 
         price = request.price
         if request.order_type == "limit" and price is not None:
@@ -206,44 +207,18 @@ class BinanceAdapter(ExchangeAdapter):
                     f"{request.symbol} order notional is below minimum after exchange rounding"
                 )
 
-        stop_price = request.stop_price
-        if is_protective:
-            if stop_price is None:
-                raise ValueError(f"{request.order_type} requires stop_price")
-            stop_price = self._round_price(stop_price, rules, up=False)
-
-        order_type = request.order_type.upper()
         params: dict[str, Any] = {
             "symbol": request.symbol,
             "side": request.side.upper(),
-            "type": order_type,
+            "type": request.order_type.upper(),
             "newClientOrderId": request.client_order_id,
             "newOrderRespType": "RESULT",
+            "quantity": self._format_quantity(quantity, int(rules["quantity_precision"])),
         }
-        if not is_whole_position:
-            params["quantity"] = self._format_quantity(quantity, int(rules["quantity_precision"]))
         if request.order_type == "limit":
             params["price"] = self._format_price(price or 0, int(rules["price_precision"]))
             params["timeInForce"] = request.time_in_force or "GTC"
-        if is_protective:
-            params["stopPrice"] = self._format_price(stop_price, int(rules["price_precision"]))
-            if request.close_position:
-                params["closePosition"] = "true"
-            if request.working_type:
-                params["workingType"] = request.working_type
-        if is_trailing:
-            # Binance TRAILING_STOP_MARKET: callbackRate (0.1–10, 1-decimal precision)
-            # is mandatory; activationPrice is optional (defers trailing until reached).
-            if request.callback_rate is None:
-                raise ValueError("trailing_stop_market requires callback_rate")
-            params["callbackRate"] = f"{request.callback_rate:.1f}"
-            if request.activation_price is not None:
-                activation = self._round_price(request.activation_price, rules, up=False)
-                params["activationPrice"] = self._format_price(activation, int(rules["price_precision"]))
-            if request.working_type:
-                params["workingType"] = request.working_type
-        # Binance rejects reduceOnly + closePosition together; closePosition already implies it.
-        if self.futures and request.reduce_only and not request.close_position:
+        if self.futures and request.reduce_only:
             params["reduceOnly"] = "true"
         params = {key: value for key, value in params.items() if value is not None}
         path = "/fapi/v1/order" if self.futures else "/api/v3/order"
@@ -288,6 +263,101 @@ class BinanceAdapter(ExchangeAdapter):
             average_price=float(raw.get("avgPrice") or 0) or None,
             raw=raw,
         )
+
+    # ----- Phase 2B adapter remediation: Binance Algo Order endpoints -----
+    # Conditional order types migrated to /fapi/v1/algoOrder (effective 2025-12-09).
+    # Param renames vs /fapi/v1/order: stopPrice->triggerPrice,
+    # activationPrice->activatePrice, newClientOrderId->clientAlgoId. Response id is
+    # algoId (normalized to OrderResult.order_id), status is algoStatus.
+
+    def _algo_result(
+        self, raw: dict, *, symbol: str, side: str = "buy", order_type: str = "stop_market", quantity: float = 0.0
+    ) -> OrderResult:
+        return OrderResult(
+            order_id=str(raw.get("algoId") or ""),
+            symbol=raw.get("symbol", symbol),
+            status=str(raw.get("algoStatus") or "new").lower(),
+            side=str(raw.get("side", side)).lower(),  # type: ignore[arg-type]
+            order_type=str(raw.get("orderType", order_type)).lower(),  # type: ignore[arg-type]
+            quantity=float(raw.get("quantity") or quantity or 0),
+            filled_quantity=float(raw.get("executedQty") or 0),
+            average_price=float(raw.get("avgPrice") or 0) or None,
+            raw=raw,
+        )
+
+    async def place_algo_order(self, request: OrderRequest) -> OrderResult:
+        if not self.futures:
+            raise ValueError("algo orders are futures-only")
+        if request.order_type not in ("stop_market", "take_profit_market", "trailing_stop_market"):
+            raise ValueError(f"{request.order_type} is not a conditional algo order type")
+        rules = await self.fetch_symbol_rules(request.symbol)
+        is_trailing = request.order_type == "trailing_stop_market"
+        is_whole_position = request.close_position  # closePosition => Close-All, no quantity
+
+        quantity = request.quantity
+        if not is_whole_position:
+            quantity = self._round_quantity(quantity, rules, request.order_type)
+            if quantity < rules["min_qty"]:
+                raise ValueError(f"{request.symbol} quantity is below minimum after exchange rounding")
+
+        params: dict[str, Any] = {
+            "algoType": "CONDITIONAL",
+            "symbol": request.symbol,
+            "side": request.side.upper(),
+            "type": request.order_type.upper(),
+            "newOrderRespType": "RESULT",
+        }
+        if request.client_order_id:
+            params["clientAlgoId"] = request.client_order_id
+        if not is_whole_position:
+            params["quantity"] = self._format_quantity(quantity, int(rules["quantity_precision"]))
+        if is_trailing:
+            if request.callback_rate is None:
+                raise ValueError("trailing_stop_market requires callback_rate")
+            params["callbackRate"] = f"{request.callback_rate:.1f}"
+            if request.activation_price is not None:
+                activate = self._round_price(request.activation_price, rules, up=False)
+                params["activatePrice"] = self._format_price(activate, int(rules["price_precision"]))
+        else:
+            if request.stop_price is None:
+                raise ValueError(f"{request.order_type} requires stop_price (triggerPrice)")
+            trigger = self._round_price(request.stop_price, rules, up=False)
+            params["triggerPrice"] = self._format_price(trigger, int(rules["price_precision"]))
+        if request.close_position:
+            params["closePosition"] = "true"
+        if request.working_type:
+            params["workingType"] = request.working_type
+        # reduceOnly is incompatible with closePosition (which is already reduce-only).
+        if request.reduce_only and not request.close_position:
+            params["reduceOnly"] = "true"
+
+        raw = await self._signed_request("POST", "/fapi/v1/algoOrder", params=params)
+        return self._algo_result(
+            raw, symbol=request.symbol, side=request.side,
+            order_type=request.order_type, quantity=quantity,
+        )
+
+    async def cancel_algo_order(self, symbol: str, algo_id: str) -> OrderResult:
+        # Success is HTTP-status based: _signed_request raises on non-2xx, so reaching
+        # here means the cancel was acknowledged. The DELETE body's algoStatus is null
+        # on testnet, so we do NOT trust it — callers that need confirmation re-GET.
+        raw = await self._signed_request("DELETE", "/fapi/v1/algoOrder", params={"symbol": symbol, "algoId": algo_id})
+        if not isinstance(raw, dict):
+            raw = {}
+        raw.setdefault("algoId", algo_id)
+        result = self._algo_result(raw, symbol=symbol)
+        result.status = "canceled"
+        return result
+
+    async def fetch_algo_order(self, symbol: str, algo_id: str) -> OrderResult:
+        raw = await self._signed_request("GET", "/fapi/v1/algoOrder", params={"symbol": symbol, "algoId": algo_id})
+        return self._algo_result(raw, symbol=symbol)
+
+    async def fetch_open_algo_orders(self, symbol: str | None = None) -> list[OrderResult]:
+        params = {"symbol": symbol} if symbol else {}
+        raw = await self._signed_request("GET", "/fapi/v1/algoOpenOrders", params=params)
+        items = raw if isinstance(raw, list) else raw.get("orders", []) if isinstance(raw, dict) else []
+        return [self._algo_result(item, symbol=item.get("symbol", symbol or "")) for item in items]
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[OrderResult]:
         path = "/fapi/v1/openOrders" if self.futures else "/api/v3/openOrders"

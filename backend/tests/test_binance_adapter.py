@@ -51,7 +51,7 @@ def test_binance_symbol_rules_select_requested_symbol_not_first_result():
     assert selected["quantityPrecision"] == 3
 
 
-# ---- Phase 2B Branch 1: STOP_MARKET / TAKE_PROFIT_MARKET param generation ----
+# ---- Phase 2B adapter remediation: Algo Order (/fapi/v1/algoOrder) param generation ----
 
 import pytest  # noqa: E402
 from app.config.settings import TradingMode  # noqa: E402
@@ -64,117 +64,142 @@ _RULES = {
 }
 
 
-@pytest.mark.asyncio
-async def test_place_stop_market_closePosition_sends_expected_params(monkeypatch):
-    """closePosition=True => no quantity, stopPrice rounded, no reduceOnly, no price/timeInForce."""
+def _algo_adapter(monkeypatch, captured: dict, *, response: dict | None = None):
     adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
     async def _fake_rules(_): return _RULES
-    captured: dict = {}
     async def _fake_signed(method, path, params=None):
         captured["method"] = method; captured["path"] = path; captured["params"] = dict(params or {})
-        return {"orderId": 12345, "status": "NEW"}
+        return response if response is not None else {"algoId": 555, "algoStatus": "NEW", "clientAlgoId": "x"}
     monkeypatch.setattr(adapter, "fetch_symbol_rules", _fake_rules)
     monkeypatch.setattr(adapter, "_signed_request", _fake_signed)
-    req = OrderRequest(
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_place_algo_stop_closePosition_no_quantity(monkeypatch):
+    """closePosition stop => Algo endpoint, triggerPrice (NOT stopPrice), NO quantity,
+    no reduceOnly. Defensive against the -4164 condition."""
+    captured: dict = {}
+    adapter = _algo_adapter(monkeypatch, captured)
+    result = await adapter.place_algo_order(OrderRequest(
         symbol="BTCUSDT", side="sell", order_type="stop_market",
         stop_price=49995.07, close_position=True, working_type="MARK_PRICE",
-        client_order_id="proscalp-sl-abc",
-    )
-    result = await adapter.place_order(req)
-    params = captured["params"]
-    assert params["type"] == "STOP_MARKET"
-    assert params["side"] == "SELL"
-    assert params["stopPrice"] == "49995"  # rounded down to tick_size 0.1 (49995.0 then trailing zeros stripped)
-    assert params["closePosition"] == "true"
-    assert params["workingType"] == "MARK_PRICE"
-    assert "quantity" not in params  # closePosition implies no quantity
-    assert "price" not in params
-    assert "timeInForce" not in params
-    assert "reduceOnly" not in params  # suppressed when closePosition is True
-    assert result.order_id == "12345"
+        client_order_id="proscalp-67e80a53-stop-ab12",
+    ))
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/fapi/v1/algoOrder"
+    p = captured["params"]
+    assert p["algoType"] == "CONDITIONAL"
+    assert p["type"] == "STOP_MARKET" and p["side"] == "SELL"
+    assert p["triggerPrice"] == "49995"  # renamed from stopPrice, rounded to tick 0.1
+    assert "stopPrice" not in p
+    assert p["closePosition"] == "true"
+    assert p["workingType"] == "MARK_PRICE"
+    assert p["clientAlgoId"] == "proscalp-67e80a53-stop-ab12"
+    assert "newClientOrderId" not in p
+    assert "quantity" not in p       # closePosition => no quantity (the -4164 guard)
+    assert "reduceOnly" not in p
+    assert result.order_id == "555"  # algoId normalized to order_id
+    assert result.status == "new"    # algoStatus normalized to status
 
 
 @pytest.mark.asyncio
-async def test_place_take_profit_market_uses_correct_type(monkeypatch):
-    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
-    async def _fake_rules(_): return _RULES
+async def test_place_algo_tp_tier_reduceonly_has_quantity(monkeypatch):
     captured: dict = {}
-    async def _fake_signed(method, path, params=None):
-        captured["params"] = dict(params or {}); return {"orderId": 1, "status": "NEW"}
-    monkeypatch.setattr(adapter, "fetch_symbol_rules", _fake_rules)
-    monkeypatch.setattr(adapter, "_signed_request", _fake_signed)
-    req = OrderRequest(
-        symbol="BTCUSDT", side="buy", order_type="take_profit_market",
-        stop_price=51000.0, close_position=True, working_type="MARK_PRICE",
-    )
-    await adapter.place_order(req)
-    assert captured["params"]["type"] == "TAKE_PROFIT_MARKET"
-    assert captured["params"]["side"] == "BUY"
-    assert captured["params"]["closePosition"] == "true"
-
-
-@pytest.mark.asyncio
-async def test_place_stop_market_without_stop_price_raises():
-    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
-    req = OrderRequest(symbol="BTCUSDT", side="sell", order_type="stop_market", close_position=True)
-    with pytest.raises(ValueError, match="requires stop_price"):
-        await adapter.place_order(req)
-
-
-# ---- Phase 2B Branch 2: reduceOnly TP tier + TRAILING_STOP_MARKET runner params ----
-
-
-@pytest.mark.asyncio
-async def test_place_reduce_only_tp_tier_sends_quantity_and_reduceonly(monkeypatch):
-    """A ladder TP tier is a reduceOnly quantity order (NOT closePosition) so it
-    can express a partial size."""
-    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
-    async def _fake_rules(_): return _RULES
-    captured: dict = {}
-    async def _fake_signed(method, path, params=None):
-        captured["params"] = dict(params or {}); return {"orderId": 7, "status": "NEW"}
-    monkeypatch.setattr(adapter, "fetch_symbol_rules", _fake_rules)
-    monkeypatch.setattr(adapter, "_signed_request", _fake_signed)
-    req = OrderRequest(
+    adapter = _algo_adapter(monkeypatch, captured)
+    await adapter.place_algo_order(OrderRequest(
         symbol="BTCUSDT", side="sell", order_type="take_profit_market",
         quantity=0.05, stop_price=50250.0, reduce_only=True, working_type="MARK_PRICE",
-    )
-    await adapter.place_order(req)
-    params = captured["params"]
-    assert params["type"] == "TAKE_PROFIT_MARKET"
-    assert params["quantity"] == "0.05"
-    assert params["reduceOnly"] == "true"
-    assert "closePosition" not in params
-    assert params["stopPrice"] == "50250"
+    ))
+    p = captured["params"]
+    assert p["type"] == "TAKE_PROFIT_MARKET"
+    assert p["quantity"] == "0.05"
+    assert p["reduceOnly"] == "true"
+    assert "closePosition" not in p
+    assert p["triggerPrice"] == "50250"
 
 
 @pytest.mark.asyncio
-async def test_place_trailing_stop_market_sends_callback_and_activation(monkeypatch):
-    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
-    async def _fake_rules(_): return _RULES
+async def test_place_algo_trailing_has_callback_activate_no_trigger(monkeypatch):
     captured: dict = {}
-    async def _fake_signed(method, path, params=None):
-        captured["params"] = dict(params or {}); return {"orderId": 9, "status": "NEW"}
-    monkeypatch.setattr(adapter, "fetch_symbol_rules", _fake_rules)
-    monkeypatch.setattr(adapter, "_signed_request", _fake_signed)
-    req = OrderRequest(
+    adapter = _algo_adapter(monkeypatch, captured)
+    await adapter.place_algo_order(OrderRequest(
         symbol="BTCUSDT", side="sell", order_type="trailing_stop_market",
         quantity=0.02, callback_rate=0.6, activation_price=50500.0,
         reduce_only=True, working_type="MARK_PRICE",
-    )
-    await adapter.place_order(req)
-    params = captured["params"]
-    assert params["type"] == "TRAILING_STOP_MARKET"
-    assert params["callbackRate"] == "0.6"
-    assert params["activationPrice"] == "50500"
-    assert params["quantity"] == "0.02"
-    assert params["reduceOnly"] == "true"
+    ))
+    p = captured["params"]
+    assert p["type"] == "TRAILING_STOP_MARKET"
+    assert p["callbackRate"] == "0.6"
+    assert p["activatePrice"] == "50500"   # renamed from activationPrice
+    assert "activationPrice" not in p
+    assert p["quantity"] == "0.02"
+    assert p["reduceOnly"] == "true"
+    assert "triggerPrice" not in p          # trailing uses activatePrice, not triggerPrice
 
 
 @pytest.mark.asyncio
-async def test_place_trailing_stop_market_without_callback_raises():
-    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
-    adapter._symbol_rules_cache["BTCUSDT"] = _RULES  # avoid the HTTP rules fetch
-    req = OrderRequest(symbol="BTCUSDT", side="sell", order_type="trailing_stop_market", quantity=0.02)
+async def test_place_algo_stop_without_trigger_raises(monkeypatch):
+    captured: dict = {}
+    adapter = _algo_adapter(monkeypatch, captured)
+    with pytest.raises(ValueError, match="requires stop_price"):
+        await adapter.place_algo_order(OrderRequest(
+            symbol="BTCUSDT", side="sell", order_type="stop_market", close_position=True))
+
+
+@pytest.mark.asyncio
+async def test_place_algo_trailing_without_callback_raises(monkeypatch):
+    captured: dict = {}
+    adapter = _algo_adapter(monkeypatch, captured)
     with pytest.raises(ValueError, match="requires callback_rate"):
-        await adapter.place_order(req)
+        await adapter.place_algo_order(OrderRequest(
+            symbol="BTCUSDT", side="sell", order_type="trailing_stop_market", quantity=0.02))
+
+
+@pytest.mark.asyncio
+async def test_place_order_rejects_conditional_types():
+    """Entry path must refuse conditional types (they 400 with -4120 on /fapi/v1/order)."""
+    adapter = BinanceAdapter(Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
+    for ot in ("stop_market", "take_profit_market", "trailing_stop_market"):
+        with pytest.raises(ValueError, match="use place_algo_order"):
+            await adapter.place_order(OrderRequest(symbol="BTCUSDT", side="sell", order_type=ot, quantity=0.01))
+
+
+@pytest.mark.asyncio
+async def test_cancel_algo_order_success_is_http_based(monkeypatch):
+    """DELETE returns a null algoStatus on testnet; success must come from HTTP 2xx,
+    so the result status is 'canceled' regardless of the body."""
+    captured: dict = {}
+    adapter = _algo_adapter(monkeypatch, captured, response={"algoId": 555, "algoStatus": None})
+    result = await adapter.cancel_algo_order("BTCUSDT", "555")
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == "/fapi/v1/algoOrder"
+    assert captured["params"] == {"symbol": "BTCUSDT", "algoId": "555"}
+    assert result.status == "canceled"
+    assert result.order_id == "555"
+
+
+@pytest.mark.asyncio
+async def test_fetch_algo_order_normalizes_fields(monkeypatch):
+    captured: dict = {}
+    resp = {"algoId": 999, "algoStatus": "FILLED", "orderType": "TAKE_PROFIT_MARKET",
+            "side": "SELL", "avgPrice": "50250.5", "executedQty": "0.05", "quantity": "0.05"}
+    adapter = _algo_adapter(monkeypatch, captured, response=resp)
+    result = await adapter.fetch_algo_order("BTCUSDT", "999")
+    assert captured["method"] == "GET" and captured["path"] == "/fapi/v1/algoOrder"
+    assert result.order_id == "999"
+    assert result.status == "filled"
+    assert result.order_type == "take_profit_market"
+    assert result.average_price == 50250.5
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_algo_orders_normalizes_list(monkeypatch):
+    captured: dict = {}
+    resp = [{"algoId": 1, "algoStatus": "NEW", "symbol": "BTCUSDT", "clientAlgoId": "proscalp-x-stop-1"},
+            {"algoId": 2, "algoStatus": "NEW", "symbol": "BTCUSDT", "clientAlgoId": "proscalp-x-tp1-2"}]
+    adapter = _algo_adapter(monkeypatch, captured, response=resp)
+    orders = await adapter.fetch_open_algo_orders("BTCUSDT")
+    assert captured["path"] == "/fapi/v1/algoOpenOrders"
+    assert [o.order_id for o in orders] == ["1", "2"]
+    assert orders[0].raw["clientAlgoId"] == "proscalp-x-stop-1"  # preserved for reconciliation
