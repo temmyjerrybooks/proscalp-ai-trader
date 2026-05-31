@@ -36,6 +36,18 @@ async def _algo_request(adapter: BinanceAdapter, method: str, params: dict):
     return await adapter._signed_request(method, "/fapi/v1/algoOrder", params)
 
 
+async def _list_open_algo(adapter: BinanceAdapter) -> list:
+    # The LIST endpoint is /fapi/v1/openAlgoOrders (NOT algoOpenOrders — that 404s).
+    # Called via _signed_request directly so the smoke test validates the live
+    # endpoint independent of the adapter version running in the container.
+    raw = await adapter._signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": SYMBOL})
+    return raw if isinstance(raw, list) else []
+
+
+def _in_list(orders: list, algo_id) -> bool:
+    return any(str(o.get("algoId")) == str(algo_id) for o in orders)
+
+
 def _build_place_params(adapter: BinanceAdapter, order_type: str, mid: float, rules: dict) -> dict:
     price_prec = int(rules["price_precision"])
     # Far-from-market trigger/activation so the order can't fill in the probe window.
@@ -85,6 +97,10 @@ async def _run_one(adapter: BinanceAdapter, order_type: str, mid: float, rules: 
         got = await _algo_request(adapter, "GET", {"symbol": SYMBOL, "algoId": algo_id})
         out["steps"]["get_after_place"] = {"algoStatus": got.get("algoStatus"), "algoId": got.get("algoId")}
 
+        # LIST endpoint: the order must appear in the open-algo-orders list.
+        list_after_place = _in_list(await _list_open_algo(adapter), algo_id)
+        out["steps"]["list_after_place_found"] = list_after_place
+
         cancelled = await _algo_request(adapter, "DELETE", {"symbol": SYMBOL, "algoId": algo_id})
         out["steps"]["cancel_response"] = {"algoStatus": cancelled.get("algoStatus"), "algoId": cancelled.get("algoId")}
 
@@ -93,6 +109,15 @@ async def _run_one(adapter: BinanceAdapter, order_type: str, mid: float, rules: 
             out["steps"]["get_after_cancel"] = {"algoStatus": got2.get("algoStatus")}
         except Exception as exc:  # a cancelled/absent order may 400 on GET — that's an acceptable "gone"
             out["steps"]["get_after_cancel"] = f"GET raised (treated as gone): {exc}"
+
+        # LIST after cancel: the order must be GONE from the open-algo-orders list.
+        list_after_cancel = _in_list(await _list_open_algo(adapter), algo_id)
+        out["steps"]["list_after_cancel_found"] = list_after_cancel
+
+        if not list_after_place or list_after_cancel:
+            out["error"] = (f"LIST coverage failed: after_place_found={list_after_place} "
+                            f"after_cancel_found={list_after_cancel}")
+            return out
 
         out["ok"] = True
         return out
