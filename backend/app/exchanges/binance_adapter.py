@@ -354,8 +354,11 @@ class BinanceAdapter(ExchangeAdapter):
         return self._algo_result(raw, symbol=symbol)
 
     async def fetch_open_algo_orders(self, symbol: str | None = None) -> list[OrderResult]:
+        # Path is /fapi/v1/openAlgoOrders (NOT algoOpenOrders — the docs/intuitive
+        # ordering is wrong; verified by live probe 2026-05-31). The transposed path
+        # returns -5000 "Path ... invalid".
         params = {"symbol": symbol} if symbol else {}
-        raw = await self._signed_request("GET", "/fapi/v1/algoOpenOrders", params=params)
+        raw = await self._signed_request("GET", "/fapi/v1/openAlgoOrders", params=params)
         items = raw if isinstance(raw, list) else raw.get("orders", []) if isinstance(raw, dict) else []
         return [self._algo_result(item, symbol=item.get("symbol", symbol or "")) for item in items]
 

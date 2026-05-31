@@ -351,7 +351,7 @@ class BotRunner:
             stop_price=trigger,
             quantity=quantity,
             working_type="MARK_PRICE",
-            client_order_id=self._algo_client_id("startup", "test"),
+            client_order_id=OrderManager._algo_client_id("startup", "test"),
         )
         start = _time.perf_counter()
         try:

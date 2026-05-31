@@ -200,6 +200,6 @@ async def test_fetch_open_algo_orders_normalizes_list(monkeypatch):
             {"algoId": 2, "algoStatus": "NEW", "symbol": "BTCUSDT", "clientAlgoId": "proscalp-x-tp1-2"}]
     adapter = _algo_adapter(monkeypatch, captured, response=resp)
     orders = await adapter.fetch_open_algo_orders("BTCUSDT")
-    assert captured["path"] == "/fapi/v1/algoOpenOrders"
+    assert captured["path"] == "/fapi/v1/openAlgoOrders"  # verified live; NOT algoOpenOrders
     assert [o.order_id for o in orders] == ["1", "2"]
     assert orders[0].raw["clientAlgoId"] == "proscalp-x-stop-1"  # preserved for reconciliation

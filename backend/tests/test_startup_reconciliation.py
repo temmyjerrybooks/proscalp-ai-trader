@@ -146,3 +146,49 @@ async def test_non_proscalp_orders_are_not_touched(monkeypatch):
     db = MagicMock(); db.commit = AsyncMock()
     await runner._startup_reconciliation(db, adapter)
     assert adapter.cancelled == []  # foreign order untouched
+
+
+class _AlgoTestExchange(ExchangeAdapter):
+    """Supports the algo lifecycle the startup adapter test exercises."""
+    name = "fake"
+    def __init__(self):
+        self.placed = []; self.cancelled = []; self.gets = 0
+    async def fetch_balances(self): return []
+    async def fetch_tickers(self): return []
+    async def fetch_order_book(self, symbol, limit=50):
+        return OrderBook(symbol, bids=[(60000.0, 1)], asks=[(60001.0, 1)])
+    async def fetch_ohlcv(self, symbol, timeframe, limit=200): return []
+    async def fetch_open_orders(self, symbol=None): return []
+    async def fetch_positions(self): return []
+    async def close_position(self, symbol): return OrderResult("0", symbol, "filled", "sell", "market", 0)
+    async def set_leverage(self, symbol, leverage): return True
+    async def place_order(self, request): return OrderResult("o", request.symbol, "new", request.side, request.order_type, 0)
+    async def cancel_order(self, symbol, order_id): return OrderResult(order_id, symbol, "canceled", "sell", "market", 0)
+    async def fetch_symbol_rules(self, symbol):
+        return {"tick_size": 0.1, "step_size": 0.001, "market_step_size": 0.001,
+                "min_qty": 0.001, "min_notional": 5.0, "quantity_precision": 3.0, "price_precision": 1.0}
+    async def place_algo_order(self, request):
+        self.placed.append(request)
+        return OrderResult("algo-1", request.symbol, "new", request.side, request.order_type, request.quantity)
+    async def fetch_algo_order(self, symbol, algo_id):
+        self.gets += 1
+        return OrderResult(algo_id, symbol, "new" if self.gets == 1 else "canceled", "sell", "stop_market", 0)
+    async def cancel_algo_order(self, symbol, algo_id):
+        self.cancelled.append(algo_id)
+        return OrderResult(algo_id, symbol, "canceled", "sell", "stop_market", 0)
+
+
+@pytest.mark.asyncio
+async def test_startup_adapter_test_runs_full_algo_lifecycle():
+    """Regression for the 2026-05-31 canary crash: _startup_adapter_test must run the
+    full place->GET->cancel->GET cycle via the algo methods WITHOUT raising. The
+    original bug (self._algo_client_id — a staticmethod on OrderManager, not BotRunner)
+    shipped because nothing exercised this function end-to-end."""
+    adapter = _AlgoTestExchange()
+    runner = _runner()
+    await runner._startup_adapter_test(adapter)  # must not raise (would AttributeError pre-fix)
+    assert len(adapter.placed) == 1
+    assert adapter.placed[0].order_type == "stop_market"
+    assert adapter.placed[0].quantity > 0  # quantity order (not closePosition) for the no-position probe
+    assert adapter.placed[0].client_order_id.startswith("proscalp-startup-test-")
+    assert adapter.cancelled == ["algo-1"]
