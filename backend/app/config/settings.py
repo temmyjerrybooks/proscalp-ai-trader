@@ -138,7 +138,7 @@ class Settings(BaseSettings):
     # worst real-trade cell: -$30.68, 9% win). When False, session_score uses the
     # base value regardless of time-since-open.
     aggression_mode_enabled: bool = False
-    allow_unclear_regime_trading: bool = False
+    allow_unclear_regime_trading: bool = True  # SECOND FLIP 2026-05-31: widen trading to unclear regimes
 
     # Phase 2A — strategy enablement (disabled setups are dropped from the live
     # registry and self-reject in evaluate(); see docs/baseline-pre-phase-2a.md).
@@ -165,8 +165,8 @@ class Settings(BaseSettings):
     autonomous_trading_enabled: bool = True
     bot_loop_interval_seconds: int = 10
     bot_cycle_symbol_limit: int = 25
-    bot_max_orders_per_cycle: int = 1
-    bot_min_seconds_between_orders: int = 30
+    bot_max_orders_per_cycle: int = 2  # SECOND FLIP 2026-05-31: up from 1 (capture multi-signal cycles)
+    bot_min_seconds_between_orders: int = 10  # SECOND FLIP 2026-05-31: down from 30 (coupled with the cap bump; ~cycle length)
     signal_followup_enabled: bool = True
     signal_followup_timeframe: str = "1m"
     signal_followup_candle_limit: int = 500
@@ -201,7 +201,7 @@ class Settings(BaseSettings):
     # Two-step rollout: enable exchange_resting_exits_enabled first (single-TP path),
     # then five_tier_ladder_enabled (full ladder). NEVER ladder-on while resting-off
     # (a startup consistency check disables the ladder if that combination is detected).
-    five_tier_ladder_enabled: bool = False
+    five_tier_ladder_enabled: bool = True  # SECOND FLIP 2026-05-31: full 5-tier ladder live (starts the 120-trade judged clock)
     tp_tier_atr_multipliers: list[float] = Field(default_factory=lambda: [0.3, 0.6, 1.0, 1.6])
     tp_tier_size_pct: list[float] = Field(default_factory=lambda: [0.2, 0.2, 0.2, 0.2])
     tp_tier_min_notional_usdt: float = 5.0
