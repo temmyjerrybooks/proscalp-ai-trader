@@ -176,7 +176,7 @@ class Settings(BaseSettings):
 
     # Phase 2B Branch 1 — foundation (exchange-resting exits, measurement, sim wiring).
     # All trading-impact flags default OFF for gated rollout; measurement-only flags default ON.
-    exchange_resting_exits_enabled: bool = False  # ROLLED BACK 2026-05-31: canary crashed (_algo_client_id ref bug) + fetch_open_algo_orders 404. Re-enable after phase-2b-adapter-algo-fix-followup.
+    exchange_resting_exits_enabled: bool = True  # RE-ACTIVATED 2026-05-31 after followup fixes (canary ref bug + openAlgoOrders endpoint), smoke 3/3 incl. LIST. Ladder still gated.
     mfe_mae_logging_enabled: bool = True
     paper_sim_wired_to_live_loop: bool = False
     shadow_replay_fee_aware: bool = True
