@@ -249,9 +249,12 @@ async def st4_real_finished_tier_books(adapter: BinanceAdapter, mgr: OrderManage
         if not plan.is_ladder:
             out["error"] = f"probe too small to ladder ({plan.degraded_reason})"
             return out
-        # Put tier1 a few ticks ABOVE mark (long SELL TP) so a small upward tick
-        # triggers it — reachable but not already-past (no -2021).
-        near = adapter._round_price(mark + 3 * rules["tick_size"], rules)
+        # Put tier1 ~0.05% ABOVE mark (long SELL TP). This is far enough that it
+        # RESTS through placement latency on a volatile symbol (a few-tick offset
+        # gets -2021'd as the mark drifts past during the ~700ms round-trip), yet
+        # close enough to be reached by normal movement within the poll window.
+        # SETUP fix only — the booking assertions below are unchanged.
+        near = adapter._round_price(mark * 1.0005, rules)
         plan.tiers[0].price = near
         res = await mgr.attach_ladder_orders(plan, SYMBOL, "long", "smoke-st4", mark_price=mark)
         if not res.tier_orders:
