@@ -2,9 +2,38 @@
 
 > Read this file first at the start of every session before doing other work.
 
+## ⚑ CURRENT DEPLOYED STATE (2026-06-02, post-deploy) — AUTHORITATIVE
+
+This block supersedes any older "reverted to single-TP / productive right now / first-flip-complete" wording further down. Where this conflicts with the Phase-2B activation sections below, **this is correct** — those sections are history.
+
+**Prod runs the FIXED ladder code, shipped but INERT ("shipped, not armed").**
+- Deployed: branch `phase-2b-ladder-fix`, app code **`e1ca615`**, gate-script fix **`15e478f`** (tip). Branch-fix symbols verified live in the running container: `tier_trigger_reached`, `classify_attach`, `unexplained_residual_qty`. Container **healthy**.
+- **Three flags OFF by committed safe default** (NOT env overrides):
+  - `five_tier_ladder_enabled = False`
+  - `exchange_resting_exits_enabled = False`
+  - `allow_unclear_regime_trading = False` — was `True` on the old `ad3a28e` runtime; **tightened by this deploy**. Unclear-regime trades are now BLOCKED unless explicitly opted in; arming it is a conscious decision, not an inherited default.
+- **Trading loop STOPPED** — stopped manually via `/api/bot/stop` at ~**2026-06-01 18:42 UTC** (after the discovery cohort; the consecutive-loss guard had been rejecting trades, but the loop stop itself was a manual/API action, not a guard). It does **NOT auto-start on boot** ([main.py](backend/app/main.py) lifespan has no `bot.start()`); stays stopped until `/api/bot/start` is explicitly called.
+- **Flat:** 0 positions / 0 algo orders.
+
+> ⚠️ Earlier in this deployment, prod was found running the **buggy pre-fix ladder ARMED** (`ad3a28e` defaults `five_tier_ladder_enabled=True`/`exchange_resting_exits_enabled=True`, no `.env` override) — the believed ".env revert to ladder-OFF" never existed in prod. It was disarmed via `.env` (flags→false + backend restart) on 2026-06-02, then this fixed-code deploy made the safe state the committed default.
+
+**Recovery / backup**
+- Private remote `github.com/temmyjerrybooks/proscalp-ai-trader` (PRIVATE): `phase-2b-ladder-fix` tip `15e478f` (app `e1ca615`); `main` = `ad3a28e` (parent preserved).
+- Rollback copy on Oracle: `/opt/proscalp-ai-trader/backend/app.bak-predeploy-15e478f` — **keep until the first armed low-concurrency cohort runs clean.**
+
+**Validation done** (live testnet, isolated staging container, prod untouched): `algo_order_smoke.py` 3/3; `ladder_attach_smoke.py` 3/3 — the committed gate self-passes: real `-2021` provoked + caught via the race-fallback (`trigger_reached=False`, market-closed), full concurrent attach **~1479 ms (≈3× faster than the ~4.3 s sequential path)**, live status reads, dropped tier reads-as-CANCELED (non-fill).
+
+**Known operational gaps (Phase-2C / before real volume):**
+- **Deploy mechanism is improvised + fragile.** No `rsync` on the Windows shell; no repo auth on Oracle. Current method = full-replace `backend/app` from a tar'd clean tree (`rm -rf` + `cp -a`). An over-matching `--exclude` glob (`app/data`) crashed the first rebuild this deploy (diagnosed + recovered). **FIX BEFORE NEXT DEPLOY:** install `rsync` (use `-a --delete` per the deploy contract) OR put repo auth on Oracle for a clean `git clone` + build. Do not let the improvised full-replace become the default.
+- **Cron monitor** (`/opt/proscalp-monitor`, every 15 min) is **Phase-2A-scoped: BLIND to ladder signals** — no `ladder_sync_anomaly` / partial-attach / 60–120 milestone escalation; only the in-app RiskEvent path carries ladder anomalies. Needs a ladder-aware monitor extension (external to the bot) before the ladder runs volume.
+- **Milestone alerts:** 60/120 ladder-milestone Telegram alerts are **likely ABSENT** (the monitor has only a one-shot 50-trade milestone). Verify/build before relying on milestone alerting.
+- **Stop/start API actions are UNATTRIBUTED** (no record of who/what called stop). Add attribution + logging before real volume.
+
+**NEXT STEP — ARMING (separate, gated, NOT done).** In strict order, each operator-gated: (1) `/api/bot/start` the loop; (2) arm `exchange_resting_exits_enabled` + `five_tier_ladder_enabled` at **LOW concurrency** (NOT 2/cycle); (3) let the C2 partial-attach breaker gather its `min_sample=8` baseline before it can trip; (4) watch the first handful of live attaches; (5) only then consider ramping to 2/cycle and starting the 120-trade clock. **The 120-clock counts fresh from a CLEAN ladder going live; the discovery cohort's −$13.50 does NOT count.**
+
 ## Project overview
 
-ProScalp is a Python crypto scalping bot. Stack: FastAPI + asyncio, SQLAlchemy + Postgres, Docker Compose, Binance via testnet/mainnet adapters (a Bybit adapter also exists). Deployed on Oracle Cloud (`ubuntu@92.5.76.247`, `/opt/proscalp-ai-trader/`); source is **Windows-canonical** at `c:\Users\PC\Scalping_Bot` — the only place with git history. **No git remote yet** — single source of failure on the Windows machine. **Trading mode: testnet only. Never deploy to mainnet without explicit operator approval in the current session.**
+ProScalp is a Python crypto scalping bot. Stack: FastAPI + asyncio, SQLAlchemy + Postgres, Docker Compose, Binance via testnet/mainnet adapters (a Bybit adapter also exists). Deployed on Oracle Cloud (`ubuntu@92.5.76.247`, `/opt/proscalp-ai-trader/`); source is **Windows-canonical** at `c:\Users\PC\Scalping_Bot`. **Private git remote (2026-06-02):** `github.com/temmyjerrybooks/proscalp-ai-trader` (PRIVATE) — `origin`, authed via the machine's `gh` keyring. (Oracle has no repo auth — relevant to the deploy gap below.) **Trading mode: testnet only. Never deploy to mainnet without explicit operator approval in the current session.**
 
 ## Architecture map
 
@@ -113,7 +142,9 @@ Production image: `proscalp-ai-trader-backend:latest`, built from [backend/Docke
 
 > **Branch 2 success criterion:** judged on a fully-closed-ladder-trade count with **positive net PnL = success**, counted at final exit (the `ladder_trade_closed` audit event; one trade = one position with all tiers + runner done). Pre-activation trades are "before" comparison only. If exits are clean but the bot is still negative at the verdict mark, the signal layer becomes the prime suspect and Phase 2C focuses there. **The count and start-point were refined at deploy time — see Pending Activation Sequence below (the judged clock is now 120 ladder trades from the *ladder* flip, not 150 from the resting flip).**
 
-### ✅ Resting exits ACTIVATED 2026-05-31 (first flip COMPLETE — single-TP path live)
+### Resting exits — 2026-05-31 activation (HISTORY — superseded, see top "CURRENT DEPLOYED STATE" block)
+
+> ⚠️ **SUPERSEDED.** As of 2026-06-02 prod runs the fixed code with `exchange_resting_exits_enabled=False` and `five_tier_ladder_enabled=False` (both safe defaults), loop stopped. The narrative below is the historical 2026-05-31 activation, retained for context only — it is NOT the current runtime state.
 
 **`exchange_resting_exits_enabled = True` is live in production (commit `3f527bc`).** On the 2026-05-31 re-activation the canary (`startup_adapter_test`) **passed** on `/fapi/v1/algoOrder` (place→GET→cancel→GET-confirm), and 3-state reconciliation attached real algo STOP_MARKET + TAKE_PROFIT_MARKET orders to open positions (verified exchange-side via `fetch_open_algo_orders`). The ladder stays OFF (`five_tier_ladder_enabled=False`). Two operational learnings from the activation:
 - **`-2021 "Order would immediately trigger"` is an expected, graceful case.** A position whose pre-existing stop now sits on the wrong side of the market can't be a resting order by definition; the algo endpoint rejects it (same as `/fapi/v1/order` would), and that position **falls back to legacy polling**. A single such failure does **not** trip the circuit breaker (threshold 3/1h). Do not treat `-2021` reconciliation failures as a fault.
@@ -134,7 +165,9 @@ Production image: `proscalp-ai-trader-backend:latest`, built from [backend/Docke
 
 **First flip COMPLETE 2026-05-31** (resting exits live). `five_tier_ladder_enabled` remains `False`; the ladder code is complete and inert pending the second flip.
 
-### Pending Activation Sequence (Branch 2) — first flip DONE 2026-05-31; second flip PENDING ~20–25 trade milestone
+### Pending Activation Sequence (Branch 2) — HISTORY (superseded by the top block's ARMING sequence)
+
+> ⚠️ **SUPERSEDED.** The 2026-06-01 second-flip ran the 29-trade discovery cohort that surfaced Bugs A/B; the cohort closed −$13.50, the loop was later stopped, and 2026-06-02 shipped the fixed code (ladder OFF). The authoritative go-forward arming steps are in the top "CURRENT DEPLOYED STATE" block. The sequence below is retained for historical context.
 
 Activation is a **deliberate, staged, operator-triggered** sequence — never flip flags without an explicit operator request in-session:
 
@@ -167,7 +200,7 @@ Default report length at STOP markers: **under 300 words.** Append detail only w
 
 *Address after Phase 2A is stable:*
 
-- **No git remote** — Windows machine is a single point of failure. Set up a private GitHub/GitLab remote.
+- ~~**No git remote**~~ — RESOLVED 2026-06-02: private remote `github.com/temmyjerrybooks/proscalp-ai-trader` (authed via the Windows machine's `gh` keyring). **Follow-up:** Oracle still has no repo auth — putting auth there would also close the improvised-deploy gap (clean `git clone` + build instead of tar full-replace).
 - **No automated test in deploy pipeline** — staging+pytest is a manual gate.
 - **Two grade systems** — reconcile to one to eliminate analysis confusion.
 - **Indicator warm-up windows** — EMA200 on 120 candles is dominated by the seed; EMA50 marginal; leader `EMA21` at depth 80 under-warmed; VWAP is not session-anchored.
@@ -178,4 +211,4 @@ Default report length at STOP markers: **under 300 words.** Append detail only w
 
 ---
 
-Last updated: 2026-05-30 after Phase 2B adapter algo-fix implementation
+Last updated: 2026-06-02 — ladder-fix (Bugs A/B + items 1–4) deployed INERT to prod; see top "CURRENT DEPLOYED STATE" block.
