@@ -15,8 +15,10 @@ Gate every future ladder/algo-endpoint change on a clean run of BOTH this and
 algo_order_smoke.py before building the staging test image.
 
 Checks (must report 3/3 OK):
-  ST-1  Reproduce -2021: a tier whose trigger sits past the mark is MARKET-CLOSED
-        (fix A), recorded FILLED_AT_ATTACH — NOT skipped, NOT clamped.
+  ST-1  Provoke a REAL -2021: a below-mark tier is actually SENT (pre-check off
+        via mark_price=0), the exchange rejects it -2021, and the race-fallback
+        MARKET-closes the slice (trigger_reached=False) — NOT the pre-check path,
+        NOT skipped, NOT clamped, NOT left resting. Asserts provoked_2021=True.
   ST-2  Real partial attach: open a position, attach a ladder, drop one tier
         out-of-band, flatten; the placed-set ledger balances (INV-1) with no
         unexplained residual (INV-4).
@@ -75,46 +77,71 @@ async def _cleanup(adapter: BinanceAdapter) -> None:
             pass
 
 
-async def _open_probe(adapter: BinanceAdapter, rules: dict) -> float:
-    # Smallest viable long market entry that clears min-notional.
+async def _open_probe(adapter: BinanceAdapter, rules: dict, usd: float = 350.0) -> float:
+    # Notional-sized long entry (~$usd), NOT a hardcoded BTC qty: a FULL ladder is
+    # 5 pieces (4 tiers + runner) that must EACH clear min-notional, so the probe
+    # must sit well above 5x min-notional. $350 -> ~$70/piece, clear of $50 — and
+    # it stays valid as price moves (sized from notional, not a fixed coin amount).
     mid = await _mark(adapter)
-    raw_qty = max(rules["min_qty"], (rules["min_notional"] * 1.2) / mid)
+    raw_qty = max(rules["min_qty"], usd / mid)
     qty = adapter._round_quantity(raw_qty, rules, "market", up=True)
     await adapter.place_order(OrderRequest(symbol=SYMBOL, side="buy", order_type="market", quantity=qty))
-    # confirm fill
-    for _ in range(10):
+    for _ in range(20):
         if await _flat(adapter) > 0:
             break
         await asyncio.sleep(0.3)
     return await _flat(adapter)
 
 
-async def st1_in_profit_market_close(adapter: BinanceAdapter, mgr: OrderManager, rules: dict) -> dict:
-    out: dict = {"name": "ST-1 in-profit tier -> market close (fix A)", "ok": False, "steps": {}}
+async def st1_real_2021_market_close(adapter: BinanceAdapter, mgr: OrderManager, rules: dict) -> dict:
+    """ST-1: provoke a GENUINE -2021 on the live path and prove the race-fallback
+    market-closes the slice. The order must actually be SENT (pre-check OFF via
+    mark_price=0), so a pass where nothing was sent is impossible:
+    provoked_2021 AND trigger_reached=False are both asserted."""
+    out: dict = {"name": "ST-1 real -2021 -> market close (race-fallback)", "ok": False, "steps": {}}
     try:
         qty = await _open_probe(adapter, rules)
-        out["steps"]["position_qty"] = qty
         mark = await _mark(adapter)
+        below = adapter._round_price(mark * 0.99, rules)
+        out["steps"].update(position_qty=qty, mark=mark, below_trigger=below)
+
+        # (a) Independent proof the EXCHANGE really rejects a below-mark TP with
+        #     -2021 (so a green can never mean "no order was ever sent").
+        raw = "NO-REJECTION"
+        try:
+            await adapter.place_algo_order(OrderRequest(
+                symbol=SYMBOL, side="sell", order_type="take_profit_market",
+                quantity=adapter._round_quantity(max(rules["min_qty"], 55.0 / mark), rules, "market", up=True),
+                stop_price=below, reduce_only=True, working_type="MARK_PRICE",
+                client_order_id="proscalp-st1raw"))
+        except Exception as exc:
+            raw = str(exc)
+        provoked = ("-2021" in raw) or ("immediately trigger" in raw.lower())
+        out["steps"]["provoked_2021"] = provoked
+        out["steps"]["raw_rejection"] = raw[:200]
+
+        # (b) Branch catch: tier1 forced BELOW mark and attached with mark_price=0
+        #     so the in-profit PRE-CHECK is OFF and the tier is actually SENT ->
+        #     exchange -2021s -> race-fallback MARKET-closes it (trigger_reached=False).
         plan = await mgr.build_ladder_plan(direction="long", entry_price=mark, stop_loss=mark * 0.99,
                                            atr=mark * 0.01, quantity=qty, symbol=SYMBOL)
         if not plan.is_ladder:
             out["error"] = f"probe too small to ladder ({plan.degraded_reason})"
             return out
-        # Force the near tier's trigger to sit BELOW the mark -> already reached for
-        # a long exit (the exact -2021 condition the cohort hit).
-        plan.tiers[0].price = adapter._round_price(mark * 0.999, rules)
-        out["steps"]["forced_tier1_trigger"] = plan.tiers[0].price
-        out["steps"]["mark"] = mark
-        result = await mgr.attach_ladder_orders(plan, SYMBOL, "long", "smoke-st1", mark_price=mark)
-        immediate = [{"index": f.index, "trigger_reached": f.trigger_reached,
-                      "fill_price": f.fill_price} for f in result.immediate_fills]
-        out["steps"]["immediate_fills"] = immediate
-        out["steps"]["resting_tier_prices"] = [t.price for t in result.tier_orders]
-        # Assertions: tier 1 was taken at market (NOT skipped, NOT clamped to rest).
-        t1 = next((f for f in result.immediate_fills if f.index == 1), None)
-        assert t1 is not None and t1.trigger_reached, "tier1 was not market-closed in-profit"
-        assert plan.tiers[0].price not in [t.price for t in result.tier_orders], \
-            "tier1 was left resting (would -2021) instead of market-closed"
+        plan.tiers[0].price = below
+        result = await mgr.attach_ladder_orders(plan, SYMBOL, "long", "smoke-st1", mark_price=0.0)
+        race = [f for f in result.immediate_fills if f.index == 1 and not f.trigger_reached]
+        resting_prices = [t.price for t in result.tier_orders]
+        out["steps"]["immediate_fills"] = [{"index": f.index, "trigger_reached": f.trigger_reached,
+                                            "fill_price": f.fill_price} for f in result.immediate_fills]
+        out["steps"]["resting_tier_prices"] = resting_prices
+
+        # A real -2021 was provoked AND the slice went through the race-fallback
+        # market-close (trigger_reached=False) — NOT the pre-check, NOT skipped,
+        # NOT left resting.
+        assert provoked, "below-mark TP did NOT provoke -2021 — nothing was proven"
+        assert len(race) == 1, "tier1 did not go through the -2021 race-fallback (trigger_reached=False)"
+        assert below not in resting_prices, "tier1 was left resting instead of market-closed"
         out["ok"] = True
         return out
     except Exception as exc:
@@ -216,7 +243,7 @@ async def main() -> None:
     print(f"{SYMBOL} min_qty={rules['min_qty']} tick={rules['tick_size']} min_notional={rules['min_notional']}")
 
     results = []
-    scenarios = (st1_in_profit_market_close, st2_st3_partial_attach_and_status,
+    scenarios = (st1_real_2021_market_close, st2_st3_partial_attach_and_status,
                  st2_concurrent_attach_latency)
     for fn in scenarios:
         t0 = time.perf_counter()
