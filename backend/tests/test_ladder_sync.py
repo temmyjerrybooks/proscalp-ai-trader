@@ -152,11 +152,13 @@ async def test_two_tiers_filled_books_pnl_and_advances_stop():
 
 
 @pytest.mark.asyncio
-async def test_sync_anomaly_fires_when_exchange_qty_inconsistent():
+async def test_sync_anomaly_fires_on_status_vs_position_disagreement():
     runner = _runner()
-    trade = _ladder_trade(qty=1.0)  # entry 1.0; original_quantity baseline = 1.0
-    # tp1 left the book (detected filled) BUT the exchange still reports the FULL
-    # 1.0 position -> filled accounting (expect 0.8 remaining) disagrees by 20%.
+    trade = _ladder_trade(qty=1.0)  # original_position_qty baseline = 1.0
+    trade.extra["original_position_qty"] = 1.0
+    # tp1 reports FILLED (status-backed, 0.2 accounted) BUT the exchange still
+    # shows the FULL 1.0 position -> 0.2 was booked as filled that the position
+    # never shed. INV-4 residual = (1.0-1.0) - 0.2 = -0.2 -> |0.2|/1.0 = 20% fires.
     adapter = FakeExchange(
         positions=[Position("BTCUSDT", "long", 1.0, 1000.0, mark_price=1004.0)],
         open_order_ids={"tp2", "tp3", "tp4", "run1", "sl1"},
@@ -165,19 +167,17 @@ async def test_sync_anomaly_fires_when_exchange_qty_inconsistent():
     await runner._sync_ladder_trades(_db(), adapter, [trade])
 
     et = _event_types(runner)
-    # detection STILL proceeds: tier booked despite the anomaly
+    # attribution STILL proceeds (observational only): tier booked from status
     assert trade.extra["tier_orders"][0]["filled"] is True
     assert trade.realized_pnl > 0
     assert "ladder_tier_filled" in et
-    # and the observational tripwire fired with the diagnostic payload
     assert "ladder_sync_anomaly" in et
     payload = next(c.args[4] for c in runner._risk_event.await_args_list
                    if c.args[2] == "ladder_sync_anomaly")
-    assert payload["tiers"] == [1]
+    assert payload["unexplained_residual_qty"] == pytest.approx(-0.2)
+    assert payload["original_position_qty"] == 1.0
     assert payload["exchange_quantity"] == 1.0
-    assert payload["expected_remaining"] == pytest.approx(0.8)
-    assert payload["fetch_order_status"] == {1: "filled"}
-    assert payload["filled_tier_quantities"] == pytest.approx(0.2)
+    assert payload["accounted_filled_qty"] == pytest.approx(0.2)
     assert payload["drift_pct"] == pytest.approx(20.0)
     assert "timestamp" in payload
 
@@ -261,9 +261,13 @@ async def test_time_partial_exit_reladders_remaining():
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
     assert trade.extra["time_partial_done"] is True
-    assert trade.quantity == pytest.approx(0.5)  # 50% market-closed
-    # remaining 0.5 re-laddered into fresh tier orders
+    # 50% (0.5) market-closed by the time-partial, leaving 0.5 to re-ladder into
+    # 0.1-per-tier. mark=1004 is already past the new tier1 (1003), so item 1 takes
+    # that 0.1 slice at market immediately rather than posting a -2021 resting TP.
+    assert trade.quantity == pytest.approx(0.4)
+    # remaining 0.4 re-laddered into the 3 still-resting tiers (1006/1010/1016)
     assert trade.extra["tier_orders"]
+    assert all(not t["filled"] for t in trade.extra["tier_orders"])
     assert "ladder_time_partial" in _event_types(runner)
 
 

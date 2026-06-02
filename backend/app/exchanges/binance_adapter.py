@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import time
@@ -32,6 +33,10 @@ class BinanceAdapter(ExchangeAdapter):
         self._symbol_rules_cache: dict[str, dict[str, float]] = {}
         self._time_offset_ms: int | None = None
         self._recv_window_ms = 10_000
+        # Phase 2B item 2 — serialize the server-time resync so concurrent algo
+        # placements (the ladder gather) don't stampede GET /time. Reads of the
+        # cached offset stay lock-free; only the (re)sync is guarded.
+        self._time_sync_lock = asyncio.Lock()
 
     @property
     def public_prefix(self) -> str:
@@ -79,11 +84,15 @@ class BinanceAdapter(ExchangeAdapter):
 
     async def _timestamp_ms(self, *, force_sync: bool = False) -> int:
         if force_sync or self._time_offset_ms is None:
-            local_before = int(time.time() * 1000)
-            raw = await self._request("GET", f"{self.public_prefix}/time")
-            local_after = int(time.time() * 1000)
-            server_time = int(raw.get("serverTime") or local_after)
-            self._time_offset_ms = server_time - ((local_before + local_after) // 2)
+            async with self._time_sync_lock:
+                # Double-check: a concurrent caller may have just synced while we
+                # waited on the lock, so only the first of a burst hits GET /time.
+                if force_sync or self._time_offset_ms is None:
+                    local_before = int(time.time() * 1000)
+                    raw = await self._request("GET", f"{self.public_prefix}/time")
+                    local_after = int(time.time() * 1000)
+                    server_time = int(raw.get("serverTime") or local_after)
+                    self._time_offset_ms = server_time - ((local_before + local_after) // 2)
         return int(time.time() * 1000) + int(self._time_offset_ms or 0)
 
     @staticmethod

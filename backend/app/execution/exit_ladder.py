@@ -210,6 +210,28 @@ def build_ladder_plan(
     )
 
 
+def tier_trigger_reached(direction: str, tier_price: float, mark_price: float) -> bool:
+    """True when a TP tier's trigger already sits on the *filled* side of the mark
+    — i.e. the position has already reached this tier's target by the time we go
+    to place it.
+
+    Placing a resting TAKE_PROFIT_MARKET in this state is rejected by Binance with
+    ``-2021 "Order would immediately trigger"``. This mirrors, inverted for the
+    take-profit direction, the marching stop's never-at/above-market guard in
+    ``compute_target_stop`` (``_safe_of_mark``):
+
+      - long  exits SELL on a *rise*  -> reached when tier_price <= mark_price
+      - short exits BUY  on a *fall*  -> reached when tier_price >= mark_price
+
+    A non-positive mark (no usable price) is treated as "not reached" so the
+    caller falls back to placing the resting order rather than market-dumping a
+    slice on bad data.
+    """
+    if mark_price <= 0:
+        return False
+    return tier_price <= mark_price if direction == "long" else tier_price >= mark_price
+
+
 def should_arm_be_plus(
     *, direction: str, entry_price: float, mark_price: float, atr: float, settings: Settings
 ) -> bool:
@@ -287,6 +309,97 @@ def compute_target_stop(
     if any_tighter_blocked:
         return StopAdvance(None, 0.0, deferred=True, reason="rung at/above current mark")
     return StopAdvance(None, 0.0, reason="not tighter than current stop")
+
+
+# ----- Phase 2B ladder-fix item 3: status-driven reconciliation primitives -----
+#
+# These are pure (no I/O) so the reconciler's accounting can be unit-tested in
+# isolation. The reconciler attributes fills from a leg's *terminal status*
+# (INV-2) and measures anomalies as the quantity that left the position with no
+# status to explain it (INV-4) — never from the planned ladder shape (INV-3).
+
+# A leg's slice counts as a fill ONLY in these terminal states (INV-2).
+FILL_STATUSES = frozenset({"filled", "partially_filled", "filled_at_attach"})
+# Terminal non-fill states: the leg is gone but realized nothing on its own.
+CANCEL_STATUSES = frozenset({"canceled", "cancelled", "expired", "rejected"})
+
+
+def classify_leg_status(raw_status: str | None) -> str:
+    """Normalize a raw exchange algo-order status into the reconciler vocabulary:
+    ``filled | partially_filled | canceled | expired | rejected | resting``.
+
+    Anything not explicitly recognized as a terminal state maps to ``resting`` —
+    we never infer a fill from a leg merely being absent from the open set
+    (INV-2 / code-review gate G-1). ``triggered`` (a conditional MARKET that has
+    fired) is a fill."""
+    s = (raw_status or "").strip().lower()
+    if s in ("filled", "triggered"):
+        return "filled"
+    if s in ("partially_filled", "partial"):
+        return "partially_filled"
+    if s in ("canceled", "cancelled"):
+        return "canceled"
+    if s == "expired":
+        return "expired"
+    if s == "rejected":
+        return "rejected"
+    return "resting"
+
+
+def is_fill_status(status: str) -> bool:
+    return status in FILL_STATUSES
+
+
+def is_terminal_status(status: str) -> bool:
+    return status in FILL_STATUSES or status in CANCEL_STATUSES
+
+
+def unexplained_residual_qty(
+    original_qty: float, exchange_qty: float, accounted_filled_qty: float
+) -> float:
+    """INV-4 metric. The quantity that left the position with no terminal status
+    to account for it:
+
+        observed_decrease   = original_qty - exchange_qty
+        unexplained_residual = observed_decrease - accounted_filled_qty
+
+    ``accounted_filled_qty`` is the sum of FILLED / PARTIALLY_FILLED /
+    FILLED_AT_ATTACH leg quantities — i.e. status-backed fills only. A positive
+    result means quantity exited the position that no fill explains (the canonical
+    anomaly); a negative result means more was booked as filled than the position
+    actually shed (a phantom-fill / status-vs-position disagreement). Callers
+    compare ``abs(result) / original_qty`` against the configured threshold."""
+    observed_decrease = original_qty - exchange_qty
+    return observed_decrease - accounted_filled_qty
+
+
+def classify_attach(
+    *,
+    stop_placed: bool,
+    planned_tier_count: int,
+    rested_tier_count: int,
+    immediate_fill_count: int,
+    planned_runner: bool,
+    runner_placed: bool,
+) -> str:
+    """Phase 2B ladder-fix item 4 — classify one ladder attach for the breaker:
+
+      - ``failed``  : the closePosition stop did not place (position would be naked).
+      - ``partial`` : stop placed, but ≥1 planned slice leg neither rested nor was
+                      market-closed at attach — i.e. genuinely dropped.
+      - ``full``    : stop placed and every planned slice leg ended accounted.
+
+    A tier market-closed by fix A (``immediate_fill_count``) is ACCOUNTED, not a
+    degradation — it must not push an attach into ``partial``. Counts come from the
+    attach's placed_set ground truth (rested + immediate), consistent with INV-3
+    (G4-1) — never from the global ladder config."""
+    if not stop_placed:
+        return "failed"
+    accounted = rested_tier_count + immediate_fill_count
+    dropped = max(0, planned_tier_count - accounted)
+    if planned_runner and not runner_placed:
+        dropped += 1
+    return "partial" if dropped > 0 else "full"
 
 
 def time_exit_decision(elapsed_seconds: float, partial_done: bool, settings: Settings) -> str | None:

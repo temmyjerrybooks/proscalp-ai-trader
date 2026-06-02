@@ -138,7 +138,7 @@ class Settings(BaseSettings):
     # worst real-trade cell: -$30.68, 9% win). When False, session_score uses the
     # base value regardless of time-since-open.
     aggression_mode_enabled: bool = False
-    allow_unclear_regime_trading: bool = True  # SECOND FLIP 2026-05-31: widen trading to unclear regimes
+    allow_unclear_regime_trading: bool = False  # ladder-fix branch: safe-by-default; matches out-of-band prod revert. Re-enable only via the staged validated redeploy.
 
     # Phase 2A — strategy enablement (disabled setups are dropped from the live
     # registry and self-reject in evaluate(); see docs/baseline-pre-phase-2a.md).
@@ -194,14 +194,27 @@ class Settings(BaseSettings):
     # If attach_protective_orders fails >= threshold times in any rolling window,
     # auto-disable exchange_resting_exits_enabled in-memory for the rest of the UTC day.
     # Auto-resets at next UTC day-start. Will fire only when the flag is ON (Branch 2).
-    protective_orders_failure_threshold: int = 3
-    protective_orders_failure_window_hours: int = 1
+    protective_orders_failure_threshold: int = 3   # C1: N_fail
+    protective_orders_failure_window_hours: int = 1  # C1: W
+    # Phase 2B ladder-fix item 4 — partial-attach-rate breaker (C2). Trips when the
+    # partial-attach rate over the last M classified ladder attaches reaches P, once
+    # at least min_sample attaches have been seen (so 1-of-2 never trips). On a trip
+    # the ladder falls back to the single-TP resting path; recovery is MANUAL.
+    # ⚠️ TUNE-ON-DATA: these are starting points — recalibrate once the 120-trade
+    # clock produces a real partial-rate baseline.
+    ladder_partial_attach_window: int = 20            # M (rolling sample)
+    ladder_partial_attach_rate_threshold: float = 0.20  # P (20% partial rate)
+    ladder_partial_attach_min_sample: int = 8         # min_sample floor
+    # Phase 2B ladder-fix item 2 — per-coroutine timeout for concurrent tier/runner
+    # placement. One hung algo request must not stall the whole gather; on timeout
+    # the slice is routed as a hard-error gap (covered by the closePosition stop).
+    ladder_attach_order_timeout_s: float = 3.0
 
     # Phase 2B Branch 2 — full exit ladder. Gated under exchange_resting_exits_enabled.
     # Two-step rollout: enable exchange_resting_exits_enabled first (single-TP path),
     # then five_tier_ladder_enabled (full ladder). NEVER ladder-on while resting-off
     # (a startup consistency check disables the ladder if that combination is detected).
-    five_tier_ladder_enabled: bool = True  # SECOND FLIP 2026-05-31: full 5-tier ladder live (starts the 120-trade judged clock)
+    five_tier_ladder_enabled: bool = False  # ladder-fix branch: safe-by-default so a checkout/deploy can never auto-reactivate the ladder; matches out-of-band prod revert. Flip True only as part of the staged validated redeploy.
     tp_tier_atr_multipliers: list[float] = Field(default_factory=lambda: [0.3, 0.6, 1.0, 1.6])
     tp_tier_size_pct: list[float] = Field(default_factory=lambda: [0.2, 0.2, 0.2, 0.2])
     tp_tier_min_notional_usdt: float = 5.0
@@ -214,6 +227,12 @@ class Settings(BaseSettings):
     time_exit_partial_pct: float = 0.5
     time_exit_full_minutes: int = 45
     slippage_anomaly_bps: float = 30.0
+    # Phase 2B ladder-fix item 3 — ladder_sync_anomaly trips when the unexplained
+    # residual (quantity that left the position with no terminal FILLED/PARTIAL
+    # status to account for it) exceeds this fraction of the original position
+    # quantity. INV-4 metric: |unexplained_residual_qty| / original_position_qty.
+    # NOT (planned - observed)/planned — accounting is off tiers actually placed.
+    ladder_unexplained_residual_pct: float = 0.05
 
     @field_validator("max_concurrent_trades")
     @classmethod

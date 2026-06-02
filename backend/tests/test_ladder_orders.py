@@ -23,11 +23,21 @@ class FakeExchange(ExchangeAdapter):
     """Records an ordered event log of placements/cancels; supports fail injection."""
     name = "fake"
 
-    def __init__(self, *, fail_on_types=None):
+    def __init__(self, *, fail_on_types=None, raise_2021_on=None,
+                 raise_2021_on_prices=None, hard_fail_on_prices=None,
+                 slow_on_prices=None, slow_seconds=5.0):
         self.events: list[tuple[str, str]] = []  # ("place"|"cancel", detail)
         self.placed = []
         self.cancelled = []
         self.fail_on_types = set(fail_on_types or [])
+        # Algo order types that should raise a -2021 ("would immediately trigger")
+        # on placement, to exercise the item-1 race-fallback path.
+        self.raise_2021_on = set(raise_2021_on or [])
+        # Per-trigger-price fault injection for the item-2 concurrent gather tests.
+        self.raise_2021_on_prices = set(raise_2021_on_prices or [])   # -2021 on these triggers
+        self.hard_fail_on_prices = set(hard_fail_on_prices or [])     # non-2021 error
+        self.slow_on_prices = set(slow_on_prices or [])               # hang past the timeout
+        self.slow_seconds = slow_seconds
         self._n = 0
 
     async def fetch_balances(self): return []
@@ -61,6 +71,19 @@ class FakeExchange(ExchangeAdapter):
 
     # Ladder orders are conditional -> algo endpoints; delegate to the same recorder.
     async def place_algo_order(self, request):
+        if request.order_type in self.raise_2021_on:
+            raise RuntimeError(
+                'Binance response: {"code":-2021,"msg":"Order would immediately trigger."}'
+            )
+        if request.stop_price in self.slow_on_prices:
+            import asyncio
+            await asyncio.sleep(self.slow_seconds)  # hang -> exceeds the per-coro timeout
+        if request.stop_price in self.raise_2021_on_prices:
+            raise RuntimeError(
+                'Binance response: {"code":-2021,"msg":"Order would immediately trigger."}'
+            )
+        if request.stop_price in self.hard_fail_on_prices:
+            raise RuntimeError('Binance response: {"code":-4131,"msg":"rate limited"}')
         return await self.place_order(request)
 
     async def cancel_algo_order(self, symbol, order_id):
@@ -69,6 +92,21 @@ class FakeExchange(ExchangeAdapter):
 
 def _manager(exch):
     return OrderManager(exch, settings=Settings(trading_mode=TradingMode.TESTNET, market_type="futures"))
+
+
+def _manager_timeout(exch, timeout):
+    return OrderManager(exch, settings=Settings(
+        trading_mode=TradingMode.TESTNET, market_type="futures",
+        ladder_attach_order_timeout_s=timeout))
+
+
+def _classify(result):
+    from app.execution.exit_ladder import classify_attach
+    return classify_attach(
+        stop_placed=result.stop_order_id is not None, planned_tier_count=4,
+        rested_tier_count=len(result.tier_orders), immediate_fill_count=len(result.immediate_fills),
+        planned_runner=True, runner_placed=result.runner_order_id is not None,
+    )
 
 
 @pytest.mark.asyncio
@@ -174,13 +212,89 @@ async def test_cancel_orders_skips_none_and_captures_failures():
 @pytest.mark.asyncio
 async def test_replace_ladder_tiers_places_tiers_and_runner_only():
     exch = FakeExchange()
-    tiers, runner_id, reasons = await _manager(exch).replace_ladder_tiers(_plan(), "BTCUSDT", "long", "t1")
+    tiers, runner_id, immediate_fills, reasons = await _manager(exch).replace_ladder_tiers(
+        _plan(), "BTCUSDT", "long", "t1"
+    )
     types = [t for (_, t) in exch.events]
     assert "stop_market" not in types  # the marching stop is NOT touched
     assert types.count("take_profit_market") == 4
     assert types.count("trailing_stop_market") == 1
     assert len(tiers) == 4
+    assert immediate_fills == []
     assert runner_id is not None
+
+
+# ----- Item 1: in-profit tier handling at placement -----
+
+def test_tier_trigger_reached_pure():
+    from app.execution.exit_ladder import tier_trigger_reached
+    # long exits SELL on a rise -> reached when tier at/below mark
+    assert tier_trigger_reached("long", 1003.0, 1007.0) is True
+    assert tier_trigger_reached("long", 1010.0, 1007.0) is False
+    # short exits BUY on a fall -> reached when tier at/above mark
+    assert tier_trigger_reached("short", 997.0, 993.0) is True
+    assert tier_trigger_reached("short", 990.0, 993.0) is False
+    # non-positive mark -> never "reached" (fall back to a resting order)
+    assert tier_trigger_reached("long", 1003.0, 0.0) is False
+
+
+@pytest.mark.asyncio
+async def test_attach_in_profit_tiers_market_closed_not_skipped():
+    # mark=1007 -> tiers at 1003 & 1006 already reached (taken at market),
+    # tiers at 1010 & 1016 rest as normal TP orders. ATR=10 mults [.3,.6,1,1.6].
+    exch = FakeExchange()
+    result = await _manager(exch).attach_ladder_orders(
+        _plan("long"), "BTCUSDT", "long", "t1", mark_price=1007.0
+    )
+    assert result.success is True  # every tier accounted: 2 resting + 2 immediate
+    assert len(result.tier_orders) == 2
+    assert len(result.immediate_fills) == 2
+    assert [f.index for f in result.immediate_fills] == [1, 2]
+    assert all(f.trigger_reached for f in result.immediate_fills)
+    types = [t for (_, t) in exch.events]
+    # Stop is placed+confirmed FIRST (sequential, never in the gather). The tiers
+    # then fire concurrently, so only the stop's leading position is guaranteed.
+    assert types[0] == "stop_market"
+    rest = types[1:]
+    assert rest.count("market") == 2                 # tier1 + tier2 taken at market
+    assert rest.count("take_profit_market") == 2     # tier3 + tier4 rest
+    assert rest.count("trailing_stop_market") == 1   # runner
+    market_orders = [p for p in exch.placed if p.order_type == "market"]
+    assert len(market_orders) == 2
+    assert all(p.reduce_only and p.side == "sell" for p in market_orders)
+
+
+@pytest.mark.asyncio
+async def test_attach_2021_race_falls_back_to_market_close():
+    # Pre-check passes (mark below all tiers) but the exchange still -2021s every
+    # TP placement -> each slice falls back to an immediate market close.
+    exch = FakeExchange(raise_2021_on=["take_profit_market"])
+    result = await _manager(exch).attach_ladder_orders(
+        _plan("long"), "BTCUSDT", "long", "t1", mark_price=1002.9
+    )
+    assert result.success is True
+    assert len(result.tier_orders) == 0
+    assert len(result.immediate_fills) == 4
+    assert all(not f.trigger_reached for f in result.immediate_fills)
+    assert [f.index for f in result.immediate_fills] == [1, 2, 3, 4]  # mapping preserved
+    types = [t for (_, t) in exch.events]
+    assert types[0] == "stop_market"                       # stop first, then concurrent
+    assert types.count("market") == 4                      # all 4 -2021 -> market closed
+    assert types.count("trailing_stop_market") == 1        # runner still rested
+
+
+@pytest.mark.asyncio
+async def test_attach_2021_fallback_market_close_failure_is_recorded():
+    # -2021 on the TP AND the fallback market close also fails -> recorded as a
+    # reason, slice un-realized (still protected by the closePosition stop).
+    exch = FakeExchange(raise_2021_on=["take_profit_market"], fail_on_types=["market"])
+    result = await _manager(exch).attach_ladder_orders(
+        _plan("long"), "BTCUSDT", "long", "t1", mark_price=1002.9
+    )
+    assert result.success is False
+    assert len(result.immediate_fills) == 0
+    assert result.stop_order_id is not None  # position still protected
+    assert any("market close failed" in r for r in result.reasons)
 
 
 @pytest.mark.asyncio
@@ -200,3 +314,90 @@ async def test_build_ladder_plan_uses_adapter_rules():
     )
     assert plan.mode == "full"
     assert len(plan.tiers) == 4
+
+
+# ----- Item 2: concurrent attach (asyncio.gather) — AC2-1..AC2-7 -----
+# _plan("long") tier triggers: 1003 (idx1), 1006 (idx2), 1010 (idx3), 1016 (idx4).
+
+
+@pytest.mark.asyncio
+async def test_AC2_1_happy_path_all_rest_full():
+    # Stop confirmed first, 5 slice legs fire concurrently, all rest.
+    exch = FakeExchange()
+    result = await _manager(exch).attach_ladder_orders(_plan("long"), "BTCUSDT", "long", "t1")
+    assert result.success is True
+    assert result.stop_order_id is not None
+    assert len(result.tier_orders) == 4 and result.runner_order_id is not None
+    assert result.immediate_fills == []
+    assert _classify(result) == "full"
+
+
+@pytest.mark.asyncio
+async def test_AC2_2_stop_confirmed_before_gather():
+    exch = FakeExchange()
+    result = await _manager(exch).attach_ladder_orders(_plan("long"), "BTCUSDT", "long", "t1")
+    # The stop is the FIRST placement recorded and is resting before any tier fires.
+    assert exch.events[0] == ("place", "stop_market")
+    assert result.stop_order_id is not None
+    # exactly one stop_market placement (never re-placed, never in the gather)
+    assert [t for (_, t) in exch.events].count("stop_market") == 1
+
+
+@pytest.mark.asyncio
+async def test_AC2_3_stop_failure_aborts_no_tiers_fired():
+    exch = FakeExchange(fail_on_types=["stop_market"])
+    result = await _manager(exch).attach_ladder_orders(_plan("long"), "BTCUSDT", "long", "t1")
+    assert result.success is False
+    assert result.stop_order_id is None
+    assert result.ladder_active is False
+    assert exch.placed == []           # tiers never fired -> no orphans
+    assert result.tier_orders == [] and result.immediate_fills == []
+
+
+@pytest.mark.asyncio
+async def test_AC2_4_partial_gather_2021_subset_full():
+    # 2 of 4 tiers -2021 in the gather -> market-closed (FILLED_AT_ATTACH); rest rest.
+    exch = FakeExchange(raise_2021_on_prices={1003.0, 1006.0})
+    result = await _manager(exch).attach_ladder_orders(_plan("long"), "BTCUSDT", "long", "t1")
+    assert len(result.immediate_fills) == 2
+    assert [f.index for f in result.immediate_fills] == [1, 2]
+    assert all(not f.trigger_reached for f in result.immediate_fills)  # race, not pre-check
+    assert len(result.tier_orders) == 2 and result.runner_order_id is not None
+    assert result.success is True
+    assert _classify(result) == "full"   # market-close is accounted, not degradation
+
+
+@pytest.mark.asyncio
+async def test_AC2_5_partial_gather_hard_error_partial():
+    # 1 of 5 raises a non-2021 error -> dropped-but-protected gap; classifier PARTIAL.
+    exch = FakeExchange(hard_fail_on_prices={1003.0})
+    result = await _manager(exch).attach_ladder_orders(_plan("long"), "BTCUSDT", "long", "t1")
+    assert len(result.tier_orders) == 3
+    assert result.immediate_fills == []
+    assert any("tier 1 placement failed" in r for r in result.reasons)
+    assert result.stop_order_id is not None     # position still protected by the stop
+    assert _classify(result) == "partial"
+
+
+@pytest.mark.asyncio
+async def test_AC2_6_mapping_integrity_mixed_outcomes():
+    # idx1 (1003) -2021 -> market; idx3 (1010) hard error -> gap; idx2/idx4 rest.
+    exch = FakeExchange(raise_2021_on_prices={1003.0}, hard_fail_on_prices={1010.0})
+    result = await _manager(exch).attach_ladder_orders(_plan("long"), "BTCUSDT", "long", "t1")
+    assert [f.index for f in result.immediate_fills] == [1]            # 1003 -> market
+    assert sorted(t.index for t in result.tier_orders) == [2, 4]       # 1006, 1016 rest
+    assert any("tier 3 placement failed" in r for r in result.reasons)  # 1010 dropped
+    # disposition landed on the RIGHT tier (price matches index)
+    by_index = {t.index: t.price for t in result.tier_orders}
+    assert by_index[2] == 1006.0 and by_index[4] == 1016.0
+
+
+@pytest.mark.asyncio
+async def test_AC2_7_timeout_isolation():
+    # idx2 (1006) hangs past the per-coro timeout -> hard-error gap; others record.
+    exch = FakeExchange(slow_on_prices={1006.0}, slow_seconds=5.0)
+    result = await _manager_timeout(exch, 0.05).attach_ladder_orders(_plan("long"), "BTCUSDT", "long", "t1")
+    assert sorted(t.index for t in result.tier_orders) == [1, 3, 4]    # 3 still rested
+    assert result.runner_order_id is not None
+    assert any("tier 2 placement failed" in r for r in result.reasons)  # timeout -> gap
+    assert _classify(result) == "partial"

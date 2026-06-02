@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from uuid import uuid4
@@ -8,7 +9,7 @@ import structlog
 
 from app.config.settings import Settings, TradingMode, get_settings
 from app.exchanges.base import ExchangeAdapter, OrderBook, OrderRequest, OrderResult, WorkingType
-from app.execution.exit_ladder import LadderPlan, SymbolRules, build_ladder_plan
+from app.execution.exit_ladder import LadderPlan, SymbolRules, build_ladder_plan, tier_trigger_reached
 from app.paper_trading.simulator import PaperPosition, PaperTradingSimulator
 from app.risk.risk_engine import RiskDecision, RiskEngine, TradePermissionRequest
 from app.strategies.base_strategy import StrategySignal
@@ -46,6 +47,25 @@ class TierOrder:
 
 
 @dataclass(slots=True)
+class ImmediateFill:
+    """A tier whose trigger was already past the mark at placement time, so its
+    slice was taken at MARKET immediately instead of left as a resting TP.
+
+    Per the Phase 2B ladder-fix item 1: the position has *already* reached this
+    tier's target, so a resting TAKE_PROFIT_MARKET would be rejected with -2021
+    ("Order would immediately trigger"). Rather than skip the slice (abandoning it
+    to the time-exit at a worse price) or silently clamp the trigger (a strategy
+    change), we realize it now. The caller books the realized PnL and records the
+    tier as filled. ``trigger_reached`` distinguishes the deliberate pre-check
+    case from the ``-2021`` race-fallback (both market-close identically)."""
+    index: int
+    requested_price: float
+    quantity: float
+    fill_price: float
+    trigger_reached: bool  # True: pre-check; False: -2021 race fallback
+
+
+@dataclass(slots=True)
 class LadderOrdersResult:
     """Outcome of attach_ladder_orders (Phase 2B Branch 2).
 
@@ -58,14 +78,20 @@ class LadderOrdersResult:
     tier_orders: list[TierOrder]
     runner_order_id: str | None
     elapsed_ms: float
-    success: bool  # stop + every tier + runner all placed
+    success: bool  # stop + every tier (resting or immediately-filled) + runner all accounted
     reasons: list[str] = field(default_factory=list)
+    # Tiers whose target was already reached at placement and were taken at MARKET
+    # immediately (item 1). The caller books their realized PnL + marks them filled.
+    immediate_fills: list[ImmediateFill] = field(default_factory=list)
 
     @property
     def ladder_active(self) -> bool:
-        """True when the stop and at least one tier are live — enough for the
+        """True when the stop is live and at least one tier is accounted for —
+        either resting on the book or already taken at market — enough for the
         Branch 2 ladder sync path to manage the position."""
-        return self.stop_order_id is not None and len(self.tier_orders) > 0
+        return self.stop_order_id is not None and (
+            len(self.tier_orders) > 0 or len(self.immediate_fills) > 0
+        )
 
 
 class OrderManager:
@@ -359,11 +385,17 @@ class OrderManager:
         direction: str,
         trade_id: str,
         *,
+        mark_price: float = 0.0,
         working_type: WorkingType = "MARK_PRICE",
     ) -> LadderOrdersResult:
         """Place the full ladder: 1 marching STOP_MARKET (closePosition), N
         reduceOnly TAKE_PROFIT_MARKET tiers, and 1 reduceOnly TRAILING_STOP_MARKET
         runner. Sequential, stop first (never leave the position naked).
+
+        ``mark_price`` is the current mark at placement time. Any tier whose target
+        is already reached (``tier_trigger_reached``) is taken at MARKET immediately
+        instead of left to be rejected with -2021 (item 1); those land in
+        ``result.immediate_fills`` for the caller to book.
 
         Tier/runner placement failures are recorded but do not abort: the
         closePosition stop alone keeps the position protected.
@@ -400,21 +432,24 @@ class OrderManager:
 
         # 2-3) Take-profit tiers (reduceOnly quantity orders — closePosition can't
         #      express partial sizes) plus the trailing runner on the remainder.
-        tier_orders, runner_order_id, place_reasons = await self._place_tiers_and_runner(
-            plan, symbol, exit_side, trade_id, working_type
+        tier_orders, runner_order_id, immediate_fills, place_reasons = await self._place_tiers_and_runner(
+            plan, symbol, exit_side, direction, mark_price, trade_id, working_type
         )
         reasons.extend(place_reasons)
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        # A tier is "accounted for" if it is resting on the book OR was taken at
+        # market immediately (item 1) — both realize the slice as designed.
         success = (
             stop_order_id is not None
-            and len(tier_orders) == len(plan.tiers)
+            and len(tier_orders) + len(immediate_fills) == len(plan.tiers)
             and runner_order_id is not None
         )
         logger.info(
             "ladder_orders_attached",
             trade_id=trade_id, symbol=symbol, mode=plan.mode,
             stop_order_id=stop_order_id, tiers=len(tier_orders),
+            immediate_fills=len(immediate_fills),
             runner_order_id=runner_order_id, elapsed_ms=round(elapsed_ms, 1), success=success,
         )
         if elapsed_ms > self.settings.protective_order_max_elapsed_ms:
@@ -425,7 +460,47 @@ class OrderManager:
             )
         return LadderOrdersResult(
             mode=plan.mode, stop_order_id=stop_order_id, tier_orders=tier_orders,
-            runner_order_id=runner_order_id, elapsed_ms=elapsed_ms, success=success, reasons=reasons,
+            runner_order_id=runner_order_id, elapsed_ms=elapsed_ms, success=success,
+            reasons=reasons, immediate_fills=immediate_fills,
+        )
+
+    @staticmethod
+    def _is_would_immediately_trigger(exc: Exception) -> bool:
+        """Detect Binance -2021 ('Order would immediately trigger'). The adapter
+        appends the raw Binance JSON body to the error string, so the code is
+        visible there. Used as the race-fallback path for in-profit tiers (item 1)."""
+        text = str(exc)
+        return "-2021" in text or "immediately trigger" in text.lower()
+
+    async def _market_close_slice(
+        self, symbol: str, exit_side: str, quantity: float, mark_price: float
+    ) -> float:
+        """Realize one tier's slice at MARKET (reduceOnly). Returns the actual fill
+        price when the adapter reports it, else the supplied mark. Raises on failure
+        so the caller can record the slice as un-realized (it remains protected by
+        the marching closePosition stop)."""
+        result = await self.adapter.place_order(
+            OrderRequest(
+                symbol=symbol,
+                side=exit_side,  # type: ignore[arg-type]
+                order_type="market",
+                quantity=quantity,
+                reduce_only=True,
+            )
+        )
+        return float(result.average_price or 0.0) or mark_price
+
+    async def _timed(self, coro):
+        """Wrap a single placement in a per-coroutine timeout so one hung request
+        cannot stall the whole gather (INV2 timeout isolation). Timeouts surface as
+        an exception to the gather and route as a hard-error gap."""
+        return await asyncio.wait_for(coro, timeout=self.settings.ladder_attach_order_timeout_s)
+
+    def _tp_request(self, symbol, exit_side, tier, working_type, trade_id) -> OrderRequest:
+        return OrderRequest(
+            symbol=symbol, side=exit_side, order_type="take_profit_market",  # type: ignore[arg-type]
+            quantity=tier.quantity, stop_price=tier.price, reduce_only=True,
+            working_type=working_type, client_order_id=self._algo_client_id(trade_id, f"tp{tier.index}"),
         )
 
     async def _place_tiers_and_runner(
@@ -433,57 +508,110 @@ class OrderManager:
         plan: LadderPlan,
         symbol: str,
         exit_side: str,
+        direction: str,
+        mark_price: float,
         trade_id: str,
         working_type: WorkingType,
-    ) -> tuple[list[TierOrder], str | None, list[str]]:
-        """Place the reduceOnly TP tiers + trailing runner for a plan. Shared by
-        attach_ladder_orders (entry) and replace_ladder_tiers (time-exit reshape)."""
+    ) -> tuple[list[TierOrder], str | None, list[ImmediateFill], list[str]]:
+        """Place the reduceOnly TP tiers + trailing runner CONCURRENTLY (item 2).
+
+        The marching stop is placed+confirmed by the caller BEFORE this runs and is
+        never in the gather (INV2-1). Here, wave 1 fires every tier + the runner at
+        once via asyncio.gather(return_exceptions=True); results zip back to their
+        planned legs in order (INV2-5) and route by outcome (INV2-3/4):
+          - ok            -> RESTING TierOrder
+          - in-profit (pre-check) / -2021 race -> MARKET-close the slice -> ImmediateFill
+          - any other error / timeout          -> dropped-but-protected gap (reason)
+        The returned structures are identical to the old sequential path (INV2-2)."""
         tier_orders: list[TierOrder] = []
+        immediate_fills: list[ImmediateFill] = []
         runner_order_id: str | None = None
         reasons: list[str] = []
-        for tier in plan.tiers:
-            try:
-                tp_result = await self.adapter.place_algo_order(
-                    OrderRequest(
-                        symbol=symbol,
-                        side=exit_side,  # type: ignore[arg-type]
-                        order_type="take_profit_market",
-                        quantity=tier.quantity,
-                        stop_price=tier.price,
-                        reduce_only=True,
-                        working_type=working_type,
-                        client_order_id=self._algo_client_id(trade_id, f"tp{tier.index}"),
-                    )
-                )
-                tier_orders.append(
-                    TierOrder(index=tier.index, order_id=tp_result.order_id,
-                              price=tier.price, quantity=tier.quantity)
-                )
-            except Exception as exc:
-                reasons.append(f"tier {tier.index} placement failed: {exc}")
-                logger.error("ladder_tier_failed", trade_id=trade_id, symbol=symbol,
-                             tier=tier.index, error=str(exc))
 
-        if plan.runner_quantity > 0 and plan.runner_callback_rate is not None:
-            try:
-                runner_result = await self.adapter.place_algo_order(
-                    OrderRequest(
-                        symbol=symbol,
-                        side=exit_side,  # type: ignore[arg-type]
-                        order_type="trailing_stop_market",
-                        quantity=plan.runner_quantity,
-                        callback_rate=plan.runner_callback_rate,
-                        activation_price=plan.runner_activation_price,
-                        reduce_only=True,
-                        working_type=working_type,
-                        client_order_id=self._algo_client_id(trade_id, "runner"),
-                    )
-                )
-                runner_order_id = runner_result.order_id
-            except Exception as exc:
-                reasons.append(f"runner placement failed: {exc}")
-                logger.error("ladder_runner_failed", trade_id=trade_id, symbol=symbol, error=str(exc))
-        return tier_orders, runner_order_id, reasons
+        # Build wave-1 coroutines with order-preserving metadata. In-profit tiers
+        # (pre-check) go straight to a concurrent market close; the rest are resting
+        # algo placements. The runner is the last leg.
+        metas: list[tuple[str, object]] = []
+        coros = []
+        for tier in plan.tiers:
+            if tier_trigger_reached(direction, tier.price, mark_price):
+                metas.append(("tier_market", tier))
+                coros.append(self._timed(self._market_close_slice(symbol, exit_side, tier.quantity, mark_price)))
+            else:
+                metas.append(("tier_rest", tier))
+                coros.append(self._timed(self.adapter.place_algo_order(
+                    self._tp_request(symbol, exit_side, tier, working_type, trade_id))))
+        has_runner = plan.runner_quantity > 0 and plan.runner_callback_rate is not None
+        if has_runner:
+            metas.append(("runner", None))
+            coros.append(self._timed(self.adapter.place_algo_order(OrderRequest(
+                symbol=symbol, side=exit_side, order_type="trailing_stop_market",  # type: ignore[arg-type]
+                quantity=plan.runner_quantity, callback_rate=plan.runner_callback_rate,
+                activation_price=plan.runner_activation_price, reduce_only=True,
+                working_type=working_type, client_order_id=self._algo_client_id(trade_id, "runner")))))
+
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
+        fallback_tiers = []  # -2021 race losers needing a wave-2 market close
+        for (kind, meta), res in zip(metas, results):
+            if kind == "tier_market":
+                tier = meta  # type: ignore[assignment]
+                if isinstance(res, BaseException):
+                    reasons.append(f"tier {tier.index} in-profit market close failed: {res}")
+                    logger.error("ladder_tier_market_close_failed", trade_id=trade_id,
+                                 symbol=symbol, tier=tier.index, error=str(res))
+                else:
+                    immediate_fills.append(ImmediateFill(index=tier.index, requested_price=tier.price,
+                                                         quantity=tier.quantity, fill_price=res, trigger_reached=True))
+                    logger.info("ladder_tier_market_filled", trade_id=trade_id, symbol=symbol,
+                                tier=tier.index, reason="trigger_reached_at_placement",
+                                trigger_price=tier.price, fill_price=res)
+            elif kind == "tier_rest":
+                tier = meta  # type: ignore[assignment]
+                if isinstance(res, BaseException):
+                    # Route by exception TYPE (INV2-4): -2021 -> fix-A market close;
+                    # anything else (network / rate-limit / -4xxx / timeout) -> gap.
+                    if isinstance(res, Exception) and self._is_would_immediately_trigger(res):
+                        fallback_tiers.append(tier)
+                    else:
+                        reasons.append(f"tier {tier.index} placement failed: {res}")
+                        logger.error("ladder_tier_failed", trade_id=trade_id, symbol=symbol,
+                                     tier=tier.index, error=str(res))
+                else:
+                    tier_orders.append(TierOrder(index=tier.index, order_id=res.order_id,
+                                                 price=tier.price, quantity=tier.quantity))
+            else:  # runner
+                if isinstance(res, BaseException):
+                    reasons.append(f"runner placement failed: {res}")
+                    logger.error("ladder_runner_failed", trade_id=trade_id, symbol=symbol, error=str(res))
+                else:
+                    runner_order_id = res.order_id
+
+        # Wave 2: market-close the -2021 race losers, also concurrently. The race is
+        # still possible inside the shrunken window, so fix-A handling stays on the
+        # concurrent path (not just the old sequential one).
+        if fallback_tiers:
+            fb_results = await asyncio.gather(
+                *[self._timed(self._market_close_slice(symbol, exit_side, t.quantity, mark_price))
+                  for t in fallback_tiers],
+                return_exceptions=True,
+            )
+            for tier, res in zip(fallback_tiers, fb_results):
+                if isinstance(res, BaseException):
+                    reasons.append(f"tier {tier.index} -2021 fallback market close failed: {res}")
+                    logger.error("ladder_tier_market_close_failed", trade_id=trade_id,
+                                 symbol=symbol, tier=tier.index, error=str(res))
+                else:
+                    immediate_fills.append(ImmediateFill(index=tier.index, requested_price=tier.price,
+                                                         quantity=tier.quantity, fill_price=res, trigger_reached=False))
+                    logger.info("ladder_tier_market_filled", trade_id=trade_id, symbol=symbol,
+                                tier=tier.index, reason="2021_race_fallback",
+                                trigger_price=tier.price, fill_price=res)
+
+        # Stable tier ordering for deterministic downstream recording.
+        tier_orders.sort(key=lambda t: t.index)
+        immediate_fills.sort(key=lambda f: f.index)
+        return tier_orders, runner_order_id, immediate_fills, reasons
 
     async def replace_ladder_tiers(
         self,
@@ -492,13 +620,19 @@ class OrderManager:
         direction: str,
         trade_id: str,
         *,
+        mark_price: float = 0.0,
         working_type: WorkingType = "MARK_PRICE",
-    ) -> tuple[list[TierOrder], str | None, list[str]]:
+    ) -> tuple[list[TierOrder], str | None, list[ImmediateFill], list[str]]:
         """Re-place TP tiers + runner against a freshly-sized plan (used after the
         15-minute partial time-exit). Does NOT touch the marching stop, which is
-        closePosition and auto-sizes to whatever quantity remains."""
+        closePosition and auto-sizes to whatever quantity remains.
+
+        Like attach, any already-reached tier is taken at market immediately
+        (item 1) and surfaced in the returned ImmediateFill list."""
         exit_side = "sell" if direction == "long" else "buy"
-        return await self._place_tiers_and_runner(plan, symbol, exit_side, trade_id, working_type)
+        return await self._place_tiers_and_runner(
+            plan, symbol, exit_side, direction, mark_price, trade_id, working_type
+        )
 
     async def advance_ladder_stop(
         self,
