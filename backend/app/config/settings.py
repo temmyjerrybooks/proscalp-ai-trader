@@ -176,7 +176,7 @@ class Settings(BaseSettings):
 
     # Phase 2B Branch 1 — foundation (exchange-resting exits, measurement, sim wiring).
     # All trading-impact flags default OFF for gated rollout; measurement-only flags default ON.
-    exchange_resting_exits_enabled: bool = True  # RE-ACTIVATED 2026-05-31 after followup fixes (canary ref bug + openAlgoOrders endpoint), smoke 3/3 incl. LIST. Ladder still gated.
+    exchange_resting_exits_enabled: bool = False  # inert-by-default (2026-06-02): committed default OFF so a clean checkout is safe without the prod .env override; arm via the staged sequence. (Was True from the 2026-05-31 re-activation.)
     mfe_mae_logging_enabled: bool = True
     paper_sim_wired_to_live_loop: bool = False
     shadow_replay_fee_aware: bool = True
