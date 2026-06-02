@@ -279,9 +279,17 @@ class BinanceAdapter(ExchangeAdapter):
     # activationPrice->activatePrice, newClientOrderId->clientAlgoId. Response id is
     # algoId (normalized to OrderResult.order_id), status is algoStatus.
 
+    @staticmethod
     def _algo_result(
-        self, raw: dict, *, symbol: str, side: str = "buy", order_type: str = "stop_market", quantity: float = 0.0
+        raw: dict, *, symbol: str, side: str = "buy", order_type: str = "stop_market", quantity: float = 0.0
     ) -> OrderResult:
+        # A TRIGGERED conditional algo order reports algoStatus=FINISHED with its
+        # OWN executedQty/avgPrice null — the real child-order fill is carried in
+        # actualQty/actualPrice/actualOrderId on the SAME response (verified live
+        # 2026-06-02). Source fill detail from actual* when the algo's own fields
+        # are empty, so a FINISHED leg books the REAL fill, not a zero.
+        filled_qty = float(raw.get("executedQty") or 0) or float(raw.get("actualQty") or 0)
+        avg = float(raw.get("avgPrice") or 0) or float(raw.get("actualPrice") or 0) or None
         return OrderResult(
             order_id=str(raw.get("algoId") or ""),
             symbol=raw.get("symbol", symbol),
@@ -289,8 +297,8 @@ class BinanceAdapter(ExchangeAdapter):
             side=str(raw.get("side", side)).lower(),  # type: ignore[arg-type]
             order_type=str(raw.get("orderType", order_type)).lower(),  # type: ignore[arg-type]
             quantity=float(raw.get("quantity") or quantity or 0),
-            filled_quantity=float(raw.get("executedQty") or 0),
-            average_price=float(raw.get("avgPrice") or 0) or None,
+            filled_quantity=filled_qty,
+            average_price=avg,
             raw=raw,
         )
 

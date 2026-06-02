@@ -330,10 +330,15 @@ def classify_leg_status(raw_status: str | None) -> str:
 
     Anything not explicitly recognized as a terminal state maps to ``resting`` —
     we never infer a fill from a leg merely being absent from the open set
-    (INV-2 / code-review gate G-1). ``triggered`` (a conditional MARKET that has
-    fired) is a fill."""
+    (INV-2 / code-review gate G-1).
+
+    ``finished`` is the Binance USDⓈ-M algo-order TERMINAL fill state for a
+    triggered conditional order — verified live 2026-06-02: a triggered TP tier
+    reports ``algoStatus=FINISHED`` (its own avgPrice/executedQty null; the real
+    fill is in ``actualPrice``/``actualQty`` on the same response, sourced by the
+    adapter). ``triggered`` is retained defensively (a fired conditional)."""
     s = (raw_status or "").strip().lower()
-    if s in ("filled", "triggered"):
+    if s in ("filled", "finished", "triggered"):
         return "filled"
     if s in ("partially_filled", "partial"):
         return "partially_filled"

@@ -17,6 +17,8 @@ import pytest
 from app.config.settings import Settings, TradingMode
 from app.database.models import Trade
 from app.exchanges.base import ExchangeAdapter, OrderBook, OrderResult, Position
+from app.exchanges.binance_adapter import BinanceAdapter
+from app.execution.exit_ladder import FILL_STATUSES, classify_leg_status
 from app.services.bot_runner import BotRunner
 from unittest.mock import AsyncMock, MagicMock
 
@@ -59,10 +61,24 @@ class ReconcileFake(ExchangeAdapter):
         return await self.fetch_open_orders(symbol)
 
     async def fetch_algo_order(self, symbol, order_id):
-        spec = self._order_status.get(order_id, {"status": "new", "avg": 0.0, "filled_qty": 0.0})
-        return OrderResult(order_id, symbol, spec["status"], "sell", "take_profit_market",
-                           spec.get("qty", 0.2), filled_quantity=spec.get("filled_qty", 0.0),
-                           average_price=spec.get("avg") or None)
+        # Returns the REAL live algo-order shape and routes it through the actual
+        # adapter normalizer (BinanceAdapter._algo_result) so these tests exercise
+        # the production mapping — NOT a hand-built "filled" OrderResult.
+        # Verified-live shape for a triggered tier: algoStatus=FINISHED, the algo's
+        # OWN executedQty/avgPrice null, and the real fill in actualQty/actualPrice.
+        spec = self._order_status.get(order_id, {"status": "NEW"})
+        raw = {
+            "algoId": order_id, "symbol": symbol, "side": "SELL",
+            "orderType": "TAKE_PROFIT_MARKET", "algoStatus": spec["status"],
+            "quantity": spec.get("qty", 0.2),
+            "executedQty": spec.get("executed_qty"),   # null on a FINISHED algo order
+            "avgPrice": spec.get("avg_price"),          # null on a FINISHED algo order
+            "actualQty": spec.get("actual_qty"),        # real child-order fill qty
+            "actualPrice": spec.get("actual_price"),    # real child-order fill price
+            "actualOrderId": spec.get("actual_order_id"),
+            "actualType": "MARKET" if spec.get("actual_qty") else None,
+        }
+        return BinanceAdapter._algo_result(raw, symbol=symbol)
 
     async def fetch_order(self, symbol, order_id):
         return await self.fetch_algo_order(symbol, order_id)
@@ -142,12 +158,12 @@ async def test_AC1_partial_attach_accounting_from_placed_not_plan():
     runner = _runner()
     trade = _trade(qty=0.6, original_qty=1.0,
                    tiers=[_leg(1, "tp1", 1003.0, 0.2), _leg(2, "tp2", 1006.0, 0.2)])
-    # only tp1/tp2 ever existed; both now filled, position dropped 1.0 -> 0.6
+    # only tp1/tp2 ever existed; both now FINISHED (live terminal), position 1.0 -> 0.6
     adapter = ReconcileFake(
         positions=[Position("BTCUSDT", "long", 0.6, 1000.0, mark_price=1006.5)],
         open_algo_ids={"run1", "sl1"},
-        order_status={"tp1": {"status": "filled", "avg": 1003.0},
-                      "tp2": {"status": "filled", "avg": 1006.0}},
+        order_status={"tp1": {"status": "FINISHED", "actual_price": 1003.0, "actual_qty": 0.2},
+                      "tp2": {"status": "FINISHED", "actual_price": 1006.0, "actual_qty": 0.2}},
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
     assert trade.extra["tiers_filled"] == 2
@@ -182,7 +198,7 @@ async def test_AC3_stop_sweep_cancels_tiers_no_phantom_fill():
         positions=[],  # flat
         order_status={"tp1": {"status": "canceled"}, "tp2": {"status": "canceled"},
                       "run1": {"status": "canceled"},
-                      "sl1": {"status": "filled", "avg": 994.0}},
+                      "sl1": {"status": "FINISHED", "actual_price": 994.0, "actual_qty": 1.0}},
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
     assert trade.status == "closed"
@@ -214,14 +230,16 @@ async def test_AC4_external_close_no_anomaly():
 
 
 # AC-5 — single leg partial-then-cancel: fills 0.4 of 0.5, stop sweeps 0.1.
+# (PARTIALLY_FILLED algoStatus is modeled here; only FINISHED full-fills were
+# observed live, so the partial shape is a logical unit test of partial handling.)
 @pytest.mark.asyncio
 async def test_AC5_partial_then_cancel_balances():
     runner = _runner()
     trade = _trade(qty=0.5, tiers=[_leg(1, "tp1", 1003.0, 0.5)], runner_id=None, runner_qty=0.0)
     adapter = ReconcileFake(
         positions=[],
-        order_status={"tp1": {"status": "partially_filled", "avg": 1003.0, "filled_qty": 0.4},
-                      "sl1": {"status": "filled", "avg": 994.0}},
+        order_status={"tp1": {"status": "PARTIALLY_FILLED", "actual_price": 1003.0, "actual_qty": 0.4},
+                      "sl1": {"status": "FINISHED", "actual_price": 994.0, "actual_qty": 0.1}},
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
     leg = trade.extra["tier_orders"][0]
@@ -245,8 +263,8 @@ async def test_AC6_stop_progression_churn_ignored_in_accounting():
     adapter = ReconcileFake(
         positions=[Position("BTCUSDT", "long", 0.6, 1000.0, mark_price=1011.0)],
         open_algo_ids={"run1", "sl1"},
-        order_status={"tp1": {"status": "filled", "avg": 1003.0},
-                      "tp2": {"status": "filled", "avg": 1006.0}},
+        order_status={"tp1": {"status": "FINISHED", "actual_price": 1003.0, "actual_qty": 0.2},
+                      "tp2": {"status": "FINISHED", "actual_price": 1006.0, "actual_qty": 0.2}},
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
     assert "ladder_stop_advanced" in _events(runner)
@@ -265,7 +283,7 @@ async def test_AC7_dedup_books_fill_once():
     adapter = ReconcileFake(
         positions=[Position("BTCUSDT", "long", 0.8, 1000.0, mark_price=1004.0)],
         open_algo_ids={"tp2", "run1", "sl1"},
-        order_status={"tp1": {"status": "filled", "avg": 1003.0}},
+        order_status={"tp1": {"status": "FINISHED", "actual_price": 1003.0, "actual_qty": 0.2}},
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
     pnl_after_first = trade.realized_pnl
@@ -301,6 +319,72 @@ async def test_AC8_unexplained_residual_fires_anomaly():
     assert payload["unexplained_residual_qty"] == pytest.approx(0.2)
     assert payload["accounted_filled_qty"] == pytest.approx(0.0)
     assert payload["drift_pct"] == pytest.approx(20.0)
+
+
+# ===== FINISHED-status regression tests (the live bug found at arming) =====
+
+# Adapter unit test: _algo_result must source fill price/qty from actual* when the
+# algo object's own executedQty/avgPrice are null (the live FINISHED shape).
+def test_algo_result_sources_actual_fields_on_finished():
+    finished_raw = {
+        "algoId": "1000000093736374", "symbol": "TRXUSDT", "side": "SELL",
+        "orderType": "TAKE_PROFIT_MARKET", "algoStatus": "FINISHED",
+        "quantity": 285, "executedQty": None, "avgPrice": None,
+        "actualType": "MARKET", "actualOrderId": 740725309,
+        "actualPrice": 0.34260, "actualQty": 285,
+    }
+    r = BinanceAdapter._algo_result(finished_raw, symbol="TRXUSDT")
+    assert classify_leg_status(r.status) in FILL_STATUSES   # finished -> fill
+    assert r.filled_quantity == pytest.approx(285)          # from actualQty, not 0
+    assert r.average_price == pytest.approx(0.34260)        # from actualPrice, not None
+    # a NEW (resting) order has no actual* -> not a fill, zero qty
+    new_raw = {"algoId": "x", "symbol": "TRXUSDT", "algoStatus": "NEW", "quantity": 285}
+    rn = BinanceAdapter._algo_result(new_raw, symbol="TRXUSDT")
+    assert classify_leg_status(rn.status) == "resting"
+    assert rn.filled_quantity == 0 and rn.average_price is None
+
+
+# Core regression: a tier that goes FINISHED mid-life is BOOKED from actual*
+# (qty + price), tiers_filled advances, and NO anomaly (this is the exact bug).
+@pytest.mark.asyncio
+async def test_finished_tier_books_from_actual_no_anomaly():
+    runner = _runner()
+    trade = _trade(qty=0.8, original_qty=1.0,
+                   tiers=[_leg(1, "tp1", 1003.0, 0.2), _leg(2, "tp2", 1006.0, 0.2)])
+    # tp1 left the open set and reports FINISHED with the real fill in actual*.
+    adapter = ReconcileFake(
+        positions=[Position("BTCUSDT", "long", 0.8, 1000.0, mark_price=1004.0)],
+        open_algo_ids={"tp2", "run1", "sl1"},
+        order_status={"tp1": {"status": "FINISHED", "actual_price": 1003.5, "actual_qty": 0.2}},
+    )
+    await runner._sync_ladder_trades(_db(), adapter, [trade])
+    leg = trade.extra["tier_orders"][0]
+    assert leg["filled"] is True
+    assert leg["filled_qty"] == pytest.approx(0.2)        # booked from actualQty
+    assert leg["fill_price"] == pytest.approx(1003.5)     # booked from actualPrice
+    assert trade.extra["tiers_filled"] == 1
+    assert "ladder_tier_filled" in _events(runner)
+    assert "ladder_sync_anomaly" not in _events(runner)   # accounted 0.2 == observed 0.2
+
+
+# Part 3: a runner that FINISHED closes the position -> attribute as the runner,
+# NOT external_close (the same enum gap mislabelled BTC/DOGE as external_close).
+@pytest.mark.asyncio
+async def test_finished_runner_attributes_as_runner_close():
+    runner = _runner()
+    trade = _trade(qty=0.2, original_qty=0.2,
+                   tiers=[_leg(1, "tp1", 1003.0, 0.2)], runner_id="run1", runner_qty=0.2)
+    adapter = ReconcileFake(
+        positions=[],  # flat: runner closed it
+        order_status={"tp1": {"status": "canceled"},
+                      "sl1": {"status": "expired"},
+                      "run1": {"status": "FINISHED", "actual_price": 1020.0, "actual_qty": 0.2}},
+    )
+    await runner._sync_ladder_trades(_db(), adapter, [trade])
+    closed = _payload(runner, "ladder_trade_closed")
+    assert closed["reason"] == "trailing_runner_exchange"  # NOT external_close
+    assert closed["ledger_balanced"] is True
+    assert "ladder_sync_anomaly" not in _events(runner)
 
 
 # ----- Item 2 <-> 1/3/4 integration: concurrent attach feeds the pipeline -----

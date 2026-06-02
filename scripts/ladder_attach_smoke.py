@@ -234,6 +234,63 @@ async def st2_concurrent_attach_latency(adapter: BinanceAdapter, mgr: OrderManag
         await _cleanup(adapter)
 
 
+async def st4_real_finished_tier_books(adapter: BinanceAdapter, mgr: OrderManager, rules: dict) -> dict:
+    """ST-4 (the test that would have caught the live bug): let a real tier TRIGGER
+    and go FINISHED on testnet, then assert it books from status + actual* and the
+    quantity ledger balances (no unexplained residual). Market-timing dependent —
+    if the tier doesn't trigger within the poll window it reports INCONCLUSIVE
+    (re-run during active movement), which is distinct from a fix failure."""
+    out: dict = {"name": "ST-4 real FINISHED tier books from actual* (INV balance)", "ok": False, "steps": {}}
+    try:
+        qty = await _open_probe(adapter, rules)
+        mark = await _mark(adapter)
+        plan = await mgr.build_ladder_plan(direction="long", entry_price=mark, stop_loss=mark * 0.99,
+                                           atr=mark * 0.01, quantity=qty, symbol=SYMBOL)
+        if not plan.is_ladder:
+            out["error"] = f"probe too small to ladder ({plan.degraded_reason})"
+            return out
+        # Put tier1 a few ticks ABOVE mark (long SELL TP) so a small upward tick
+        # triggers it — reachable but not already-past (no -2021).
+        near = adapter._round_price(mark + 3 * rules["tick_size"], rules)
+        plan.tiers[0].price = near
+        res = await mgr.attach_ladder_orders(plan, SYMBOL, "long", "smoke-st4", mark_price=mark)
+        if not res.tier_orders:
+            out["error"] = "no resting tier placed"
+            return out
+        t1 = res.tier_orders[0]
+        out["steps"].update(original_qty=qty, tier1_trigger=near, algo_id=t1.order_id)
+        # Poll until tier1 goes FINISHED (price must tick up to `near`).
+        deadline = time.time() + 150
+        while time.time() < deadline:
+            o = await adapter.fetch_algo_order(SYMBOL, t1.order_id)
+            if str(o.raw.get("algoStatus")).upper() == "FINISHED":
+                break
+            await asyncio.sleep(3)
+        o = await adapter.fetch_algo_order(SYMBOL, t1.order_id)
+        out["steps"].update(final_algoStatus=o.raw.get("algoStatus"), normalized_status=o.status,
+                            filled_qty=o.filled_quantity, avg_price=o.average_price,
+                            actualQty=o.raw.get("actualQty"), actualPrice=o.raw.get("actualPrice"))
+        if str(o.raw.get("algoStatus")).upper() != "FINISHED":
+            out["error"] = "INCONCLUSIVE: tier did not trigger within the window — re-run during active movement (not a fix failure)"
+            return out
+        # Booked from status + actual* (the exact fix):
+        assert classify_leg_status(o.status) in FILL_STATUSES, "FINISHED not classified as a fill"
+        assert (o.filled_quantity or 0) > 0, "filled_qty not sourced from actualQty"
+        assert (o.average_price or 0) > 0, "avg_price not sourced from actualPrice"
+        # Ledger balance: the position decrease is fully explained by the booked fill.
+        exch = await _flat(adapter)
+        residual = unexplained_residual_qty(qty, exch, o.filled_quantity)
+        out["steps"].update(exchange_qty_after=exch, unexplained_residual=residual)
+        assert abs(residual) <= qty * 0.05, f"INV residual {residual} exceeds threshold"
+        out["ok"] = True
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+    finally:
+        await _cleanup(adapter)
+
+
 async def main() -> None:
     settings = get_settings()
     adapter = BinanceAdapter(settings)
@@ -244,7 +301,7 @@ async def main() -> None:
 
     results = []
     scenarios = (st1_real_2021_market_close, st2_st3_partial_attach_and_status,
-                 st2_concurrent_attach_latency)
+                 st2_concurrent_attach_latency, st4_real_finished_tier_books)
     for fn in scenarios:
         t0 = time.perf_counter()
         res = await fn(adapter, mgr, rules)
