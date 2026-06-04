@@ -2,18 +2,23 @@
 
 > Read this file first at the start of every session before doing other work.
 
-## ⚑ CURRENT DEPLOYED STATE (2026-06-02, post-deploy) — AUTHORITATIVE
+## ⚑ CURRENT DEPLOYED STATE (2026-06-04, EXIT-FIX DEPLOYED INERT) — AUTHORITATIVE
 
-This block supersedes any older "reverted to single-TP / productive right now / first-flip-complete" wording further down. Where this conflicts with the Phase-2B activation sections below, **this is correct** — those sections are history.
+This block supersedes any older "120-run live / armed / reverted-to-single-TP / shipped-not-armed" wording anywhere below — those are history.
 
-**Prod runs the FIXED ladder code, shipped but INERT ("shipped, not armed").**
-- Deployed: branch `phase-2b-ladder-fix`, app code **`e1ca615`**, gate-script fix **`15e478f`** (tip). Branch-fix symbols verified live in the running container: `tier_trigger_reached`, `classify_attach`, `unexplained_residual_qty`. Container **healthy**.
-- **Three flags OFF by committed safe default** (NOT env overrides):
-  - `five_tier_ladder_enabled = False`
-  - `exchange_resting_exits_enabled = False`
-  - `allow_unclear_regime_trading = False` — was `True` on the old `ad3a28e` runtime; **tightened by this deploy**. Unclear-regime trades are now BLOCKED unless explicitly opted in; arming it is a conscious decision, not an inherited default.
-- **Trading loop STOPPED** — stopped manually via `/api/bot/stop` at ~**2026-06-01 18:42 UTC** (after the discovery cohort; the consecutive-loss guard had been rejecting trades, but the loop stop itself was a manual/API action, not a guard). It does **NOT auto-start on boot** ([main.py](backend/app/main.py) lifespan has no `bot.start()`); stays stopped until `/api/bot/start` is explicitly called.
-- **Flat:** 0 positions / 0 algo orders.
+**Prod runs the Phase-2C EXIT-FIX code (`phase-2c-exit-fix`, commit `873f30b`), deployed INERT — flags off, loop stopped, flat. NOT trading.**
+- In-container hashes verified == `873f30b` (settings `87fedee8…`, exit_ladder `04a76de4…`, bot_runner `a89d4ae6…`). Container **healthy**. Predeploy backup: `/opt/proscalp-ai-trader/backend/app.bak-predeploy-873f30b`.
+- **Flags INERT (`.env` matched to the committed safe default):** `five_tier_ladder_enabled=False`, `exchange_resting_exits_enabled=False`, `allow_unclear_regime_trading=False`. **Loop STOPPED** (no auto-start). **Flat: 0 positions / 0 algo orders.**
+- **`consecutive_loss_stop_after=4`** — the temporary `1000` override is GONE (restored). Phase-2A gates intact (`cap_risk_at_score=75`, `force_limit_orders=True`, `max_concurrent_trades=5`). `.env` still carries `BOT_MAX_ORDERS_PER_CYCLE=2` / `BOT_MIN_SECONDS_BETWEEN_ORDERS=10` (inert while stopped; arming sets concurrency deliberately).
+- **What the exit-fix changes (live in code, DORMANT until armed):**
+  - **TASK 1 — attribution qty-drop gate:** a FILL-status tier books only if the live position actually shed ~that qty (`qty_drop_corroborates`, recomputed sequentially — no double-book in one poll); uncorroborated → bounded re-check (N=`ladder_falsefill_recheck_budget=3`) → typed `ladder_false_fill_rejected` + residual; escalates immediately if the marching stop is absent. `_read_leg_terminal` actual-only (no trigger/mark fallback). New `ladder_qty_gate_tol_pct=0.05` (separate from the detection tripwire `ladder_unexplained_residual_pct`). Expect `ladder_sync_anomaly` → ~0 once armed (false-fills now prevented, not post-flagged).
+  - **TASK 2 — TP recalibration** (off the kline-MFE distribution, median peak 1.03×ATR): `tp_tier_atr_multipliers=[0.6,1.0,1.5,2.0]` (was [0.3,0.6,1.0,1.6]; old TP1 banked ≤0 on 75.5% of fills) + cost-aware floor `tp_tier_min_distance_pct=0.0022` (0.22%) + strict monotonicity. Trail-aware time-exit: still-favorable active runner exempt at 45m until `time_exit_hard_ceiling_minutes=90`.
+  - **TASK 3 — one rich exit summary** (NET PnL $ and %, tier gradient from cross-checked fills, BE+/runner/reason/hold); killed the duplicate close-alert pair; dropped entry score/grade/risk.
+- **Why halted:** the prior judged 120-run (T0 2026-06-02 23:52) was STOPPED 2026-06-04 after diagnosis — exits under-captured (avg win $0.63 vs avg loss $1.40, **R:R 0.45**; 75.5% of TP1 fills banked ≤0; 16 false-fill `ladder_sync_anomaly`). Those PRE-FIX results (≈90 closed, net negative) **do NOT count** toward any future verdict; the judged clock restarts clean when the fixed ladder is armed.
+- **Validation:** full suite **198 passed** locally AND in the sealed prod image (staging gate). New tests: AC-8 qty-gate (red-for-the-right-reason), AC-8 twin (unverified→closer, INV-1 balanced), partial-corroboration no-double-count, geometry floor/monotonic/short, time-exit exemption+ceiling, exit-summary. (No `binance_adapter` change → live algo-smoke gate not triggered.)
+- **TASK 4 (monitor):** `ladder_sync_anomaly` copy fixed "halt+investigate" → "INVESTIGATE — non-halting tripwire" (`phase-2c-ladder-monitor` `03d352f`, redeployed; live `check.sh` sha `cfa69dbc…`). `ladder_armed_loop_stopped` page cleared by the flags→false flip (held at 13, no growth).
+
+> ⚠️ **Clock-contamination gotcha (bit twice):** flattening positions directly via the adapter (cancel algo orders + market-close) leaves the **DB trade rows still `open`**; on the next loop start the management loop reconciles them and emits `ladder_trade_closed (external_close, balanced)` — which lands AFTER a freshly-set clock and would wrongly count. **Always let reconciliation settle (`open_trade_count`→0), then re-stamp the clock past those closes and verify fresh `ladder_trade_closed`-since-T0 == 0.**
 
 > ⚠️ Earlier in this deployment, prod was found running the **buggy pre-fix ladder ARMED** (`ad3a28e` defaults `five_tier_ladder_enabled=True`/`exchange_resting_exits_enabled=True`, no `.env` override) — the believed ".env revert to ladder-OFF" never existed in prod. It was disarmed via `.env` (flags→false + backend restart) on 2026-06-02, then this fixed-code deploy made the safe state the committed default.
 
@@ -25,11 +30,11 @@ This block supersedes any older "reverted to single-TP / productive right now / 
 
 **Known operational gaps (Phase-2C / before real volume):**
 - **Deploy mechanism is improvised + fragile.** No `rsync` on the Windows shell; no repo auth on Oracle. Current method = full-replace `backend/app` from a tar'd clean tree (`rm -rf` + `cp -a`). An over-matching `--exclude` glob (`app/data`) crashed the first rebuild this deploy (diagnosed + recovered). **FIX BEFORE NEXT DEPLOY:** install `rsync` (use `-a --delete` per the deploy contract) OR put repo auth on Oracle for a clean `git clone` + build. Do not let the improvised full-replace become the default.
-- **Cron monitor** (`/opt/proscalp-monitor`, every 15 min) is **Phase-2A-scoped: BLIND to ladder signals** — no `ladder_sync_anomaly` / partial-attach / 60–120 milestone escalation; only the in-app RiskEvent path carries ladder anomalies. Needs a ladder-aware monitor extension (external to the bot) before the ladder runs volume.
-- **Milestone alerts:** 60/120 ladder-milestone Telegram alerts are **likely ABSENT** (the monitor has only a one-shot 50-trade milestone). Verify/build before relying on milestone alerting.
+- ~~**Cron monitor BLIND to ladder signals**~~ — RESOLVED 2026-06-02 (branch `phase-2c-ladder-monitor`, commit `e4e1559`, deployed to `/opt/proscalp-monitor/check.sh`, live sha256 `f981ed9d…34db`). Now pages on `ladder_sync_anomaly` / C1 (`protective_orders_circuit_breaker`) / C2 (`ladder_circuit_breaker`) / `ladder_partial_attach` / `protective_orders_failed` (16-min window), escalates armed-but-loop-stopped, verifies Telegram delivery (`delivery.log`), and tracks the 60/120 milestones from the clock file. Phase-2A checks untouched.
+- ~~**60/120 milestone alerts likely ABSENT**~~ — RESOLVED by the same monitor change (section 5: one-shot 60/120 pages off `ladder_trade_closed` since the clock-start file).
 - **Stop/start API actions are UNATTRIBUTED** (no record of who/what called stop). Add attribution + logging before real volume.
 
-**NEXT STEP — ARMING (separate, gated, NOT done).** In strict order, each operator-gated: (1) `/api/bot/start` the loop; (2) arm `exchange_resting_exits_enabled` + `five_tier_ladder_enabled` at **LOW concurrency** (NOT 2/cycle); (3) let the C2 partial-attach breaker gather its `min_sample=8` baseline before it can trip; (4) watch the first handful of live attaches; (5) only then consider ramping to 2/cycle and starting the 120-trade clock. **The 120-clock counts fresh from a CLEAN ladder going live; the discovery cohort's −$13.50 does NOT count.**
+**NEXT STEP — ARMING THE EXIT-FIX (separate, gated, NOT done).** The new reconciler+geometry has never run armed in prod — deliberate (deployed inert for daylight between "deployed" and "armed"). In strict order, each operator-gated + watched: (1) `/api/bot/start`; (2) arm `exchange_resting_exits_enabled` then `five_tier_ladder_enabled` at **LOW concurrency** (`bot_max_orders_per_cycle=1`, NOT 2/cycle); (3) watch the first handful of live attaches — confirm `ladder_false_fill_rejected`/`ladder_sync_anomaly` stay quiet (qty-gate working) and that winners bank a real tier gradient (R:R should beat the pre-fix 0.45); (4) let the C2 partial-attach breaker gather its `min_sample=8` baseline; (5) only then consider ramping to 2/cycle + a fresh judged clock. **The clock counts fresh from the CLEAN fixed ladder; all pre-fix results do NOT count. Never leave the bot armed-and-unwatched.**
 
 ## Project overview
 
@@ -211,4 +216,4 @@ Default report length at STOP markers: **under 300 words.** Append detail only w
 
 ---
 
-Last updated: 2026-06-02 — ladder-fix (Bugs A/B + items 1–4) deployed INERT to prod; see top "CURRENT DEPLOYED STATE" block.
+Last updated: 2026-06-04 — Phase-2C exit-fix (TASK 1 attribution qty-gate, TASK 2 TP recalibration + trail-aware time-exit, TASK 3 rich exit alert; commit `873f30b`) deployed INERT to prod after the prior 120-run was halted for under-capturing exits (R:R 0.45). See top "CURRENT DEPLOYED STATE" block.
