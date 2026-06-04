@@ -215,9 +215,21 @@ class Settings(BaseSettings):
     # then five_tier_ladder_enabled (full ladder). NEVER ladder-on while resting-off
     # (a startup consistency check disables the ladder if that combination is detected).
     five_tier_ladder_enabled: bool = False  # ladder-fix branch: safe-by-default so a checkout/deploy can never auto-reactivate the ladder; matches out-of-band prod revert. Flip True only as part of the staged validated redeploy.
-    tp_tier_atr_multipliers: list[float] = Field(default_factory=lambda: [0.3, 0.6, 1.0, 1.6])
+    # Phase-2C TASK 2 — recalibrated off the kline-MFE distribution (N=97: median
+    # peak 1.03xATR, reach >=1.0xATR 51% / >=1.6 34% / >=2.0 23%). Old [0.3,0.6,1.0,1.6]
+    # put TP1 at 0.3xATR (~0.13%) inside the cost band -> 75.5% of TP1 fills banked
+    # <=0. New tuple spreads tiers across demonstrated travel; runner activates at
+    # TP4=2.0xATR and trails the >2.5xATR tail (14% of trades). TP1 also floored at
+    # tp_tier_min_distance_pct (0.22%) for low-vol regimes.
+    tp_tier_atr_multipliers: list[float] = Field(default_factory=lambda: [0.6, 1.0, 1.5, 2.0])
     tp_tier_size_pct: list[float] = Field(default_factory=lambda: [0.2, 0.2, 0.2, 0.2])
     tp_tier_min_notional_usdt: float = 5.0
+    # Phase-2C TASK 2 — TP cost-aware floor. Each tier distance = max(mult*ATR,
+    # tp_tier_min_distance_pct * entry), forced strictly monotonic so a low-vol
+    # ATR clamp can't collapse the gradient. Confirmed 2026-06-04: 0.22% clears
+    # the ~0.20% round-trip fee+slippage so a tier banks real profit (was: 75.5%
+    # of TP1 fills banked <=0 at the old 0.3xATR / ~0.13% distance).
+    tp_tier_min_distance_pct: float = 0.0022
     be_plus_activation_atr_mult: float = 0.5
     be_plus_offset_bps: float = 20.0
     stop_ladder_pct: list[float] = Field(default_factory=lambda: [0.0, 0.002, 0.005, 0.010])
@@ -226,6 +238,12 @@ class Settings(BaseSettings):
     time_exit_partial_minutes: int = 15
     time_exit_partial_pct: float = 0.5
     time_exit_full_minutes: int = 45
+    # Phase-2C TASK 2 — trail-aware exemption. At the time_exit_full mark, a still-
+    # favorable ACTIVE runner (mark beyond its activation level in the trade
+    # direction) is exempted so the trailing stop manages it, UNTIL this hard outer
+    # ceiling — past which the position is force-closed regardless (a sideways-
+    # bleeding runner the trail misses can't live forever). Confirmed 2026-06-04.
+    time_exit_hard_ceiling_minutes: int = 90
     slippage_anomaly_bps: float = 30.0
     # Phase 2B ladder-fix item 3 — ladder_sync_anomaly trips when the unexplained
     # residual (quantity that left the position with no terminal FILLED/PARTIAL
@@ -233,6 +251,17 @@ class Settings(BaseSettings):
     # quantity. INV-4 metric: |unexplained_residual_qty| / original_position_qty.
     # NOT (planned - observed)/planned — accounting is off tiers actually placed.
     ladder_unexplained_residual_pct: float = 0.05
+    # Phase-2C TASK 1 — attribution qty-drop GATE tolerance. Kept as its OWN
+    # constant (NOT reusing ladder_unexplained_residual_pct) so the booking gate
+    # and the detection tripwire stay independently tunable even though both start
+    # at 0.05. A FILL-status leg is booked only if the live position dropped by
+    # ~its qty within tol * original_position_qty.
+    ladder_qty_gate_tol_pct: float = 0.05
+    # Bounded re-check budget: a leg whose status says FILLED but whose qty drop is
+    # not yet corroborated is left non-terminal and re-polled at most this many
+    # cycles; on exhaustion it escalates to a typed ladder_false_fill_rejected and
+    # stops re-polling (no unbounded re-poll loop).
+    ladder_falsefill_recheck_budget: int = 3
 
     @field_validator("max_concurrent_trades")
     @classmethod

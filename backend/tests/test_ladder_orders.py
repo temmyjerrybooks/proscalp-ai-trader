@@ -13,8 +13,14 @@ _RULES = SymbolRules(tick_size=0.01, step_size=0.0001, min_qty=0.0001, min_notio
 
 
 def _plan(direction="long", quantity=1.0):
+    # Pin the pre-recalibration geometry so these mechanics tests stay decoupled
+    # from production tuning: tier triggers stay [1003,1006,1010,1016] =
+    # [0.3,0.6,1.0,1.6]xATR(10), which the fault-injection prices below assume.
+    # The production tuple [0.6,1.0,1.5,2.0] is validated in the geometry tests.
     return build_ladder_plan(
-        settings=Settings(), direction=direction, entry_price=1000.0, stop_loss=995.0,
+        settings=Settings(tp_tier_atr_multipliers=[0.3, 0.6, 1.0, 1.6],
+                          tp_tier_min_distance_pct=0.0),
+        direction=direction, entry_price=1000.0, stop_loss=995.0,
         atr=10.0, quantity=quantity, rules=_RULES,
     )
 

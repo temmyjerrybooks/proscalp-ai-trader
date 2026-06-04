@@ -34,6 +34,7 @@ from app.execution.exit_ladder import (
     classify_leg_status,
     compute_target_stop,
     is_terminal_status,
+    qty_drop_corroborates,
     should_arm_be_plus,
     time_exit_decision,
     unexplained_residual_qty,
@@ -1582,7 +1583,13 @@ class BotRunner:
         # 5) Time-based exits.
         opened = trade.opened_at
         elapsed = (datetime.now(timezone.utc) - opened).total_seconds() if opened else 0.0
-        decision = time_exit_decision(elapsed, bool(extra.get("time_partial_done")), self.settings)
+        decision = time_exit_decision(
+            elapsed, bool(extra.get("time_partial_done")), self.settings,
+            runner_active=bool(extra.get("runner_active")),
+            mark_price=mark,
+            runner_activation_price=extra.get("runner_activation_price"),
+            direction=trade.side,
+        )
         if decision == "full":
             await self._ladder_time_full_exit(db, adapter, manager, trade, extra, position, mark)
             return True
@@ -1642,7 +1649,9 @@ class BotRunner:
         the INV-4 unexplained-residual tripwire against the live exchange quantity."""
         tier_orders = extra.get("tier_orders") or []
         candidates = [t for t in tier_orders
-                      if t.get("order_id") and not is_terminal_status(classify_leg_status(t.get("status")))]
+                      if t.get("order_id")
+                      and not is_terminal_status(classify_leg_status(t.get("status")))
+                      and not t.get("recheck_exhausted")]
         if not candidates:
             return
         try:
@@ -1650,15 +1659,48 @@ class BotRunner:
         except Exception as exc:
             logger.warning("sync_ladder_fetch_orders_failed", symbol=trade.symbol, error=str(exc))
             return
+        original_qty = float(extra.get("original_position_qty") or extra.get("original_quantity") or 0.0)
+        # TASK 1 confirmation #2: the marching closePosition STOP is a distinct algo
+        # order (NOT a tier candidate), so re-checking a TP tier never reduces
+        # coverage. But if the STOP itself is absent from the open set while the
+        # position is still open, protection has genuinely lapsed — escalate a
+        # false-fill IMMEDIATELY rather than patiently waiting out the re-check
+        # budget (otherwise ~poll_interval x budget naked).
+        stop_present = bool(extra.get("stop_order_id")) and extra.get("stop_order_id") in open_ids
         for leg in candidates:
             if leg["order_id"] in open_ids:
                 continue  # still resting — NOT a fill (G-1: never book from absence)
             # Left the open set -> read the terminal status and branch on it (INV-2).
             status, fill_price, filled_qty = await self._read_leg_terminal(adapter, trade.symbol, leg)
             if status in FILL_STATUSES:
+                # TASK 1a: actual-sourced price+qty required (never trigger/mark).
+                if fill_price is None or filled_qty is None or filled_qty <= 0:
+                    await self._ladder_falsefill(
+                        db, trade, extra, leg, reason="no_actual_fill_data",
+                        exchange_qty=exchange_qty, accounted_prior=self._ladder_accounted_filled(extra),
+                        filled_qty=float(filled_qty or 0.0), original_qty=original_qty,
+                        protected=stop_present)
+                    continue
+                # TASK 1b: qty-drop GATE — book only if the live position actually
+                # shed this slice on top of all prior fills. accounted_prior is
+                # recomputed here, in the SAME sequential booking section, so two
+                # legs resolved in one poll can't both book against one observed_drop.
+                accounted_prior = self._ladder_accounted_filled(extra)
+                if not qty_drop_corroborates(
+                    original_qty=original_qty, exchange_qty=exchange_qty,
+                    accounted_prior=accounted_prior, filled_qty=filled_qty,
+                    tol_frac=self.settings.ladder_qty_gate_tol_pct,
+                ):
+                    await self._ladder_falsefill(
+                        db, trade, extra, leg, reason="qty_drop_not_corroborated",
+                        exchange_qty=exchange_qty, accounted_prior=accounted_prior,
+                        filled_qty=filled_qty, original_qty=original_qty,
+                        protected=stop_present)
+                    continue
                 pnl = self._ladder_book_fill(trade, extra, leg,
                                              fill_price=fill_price, filled_qty=filled_qty, status=status)
                 if pnl is not None:
+                    leg.pop("recheck_count", None)  # corroborated -> clear any pending re-check
                     await self._risk_event(
                         db, "info", "ladder_tier_filled",
                         f"{trade.symbol} TP{leg['index']} {status} at {fill_price}",
@@ -1679,29 +1721,73 @@ class BotRunner:
         extra["tier_orders"] = tier_orders
         await self._ladder_residual_crosscheck(db, trade, extra, exchange_qty)
 
+    async def _ladder_falsefill(
+        self, db: AsyncSession, trade: Trade, extra: dict, leg: dict, *,
+        reason: str, exchange_qty: float, accounted_prior: float,
+        filled_qty: float, original_qty: float, protected: bool = True,
+    ) -> None:
+        """TASK 1: a leg reported a FILL status the live position qty does NOT
+        corroborate (or it carried no actual* fill data). Do not book. Bump a
+        BOUNDED re-check counter; while budget remains AND the position stays
+        protected, leave the leg non-terminal so the next cycle re-polls (the
+        position may simply lag the status by a poll). Escalate — emit a typed
+        ``ladder_false_fill_rejected`` carrying the residual and stop re-polling
+        (recheck_exhausted -> dropped from candidates; slice goes to the closer at
+        finalize, INV-1) — when EITHER the budget is exhausted OR protection has
+        lapsed (marching stop absent; don't sit naked waiting out the budget)."""
+        leg["recheck_count"] = int(leg.get("recheck_count", 0)) + 1
+        budget = int(self.settings.ladder_falsefill_recheck_budget)
+        residual = unexplained_residual_qty(original_qty, exchange_qty, accounted_prior + filled_qty)
+        if protected and leg["recheck_count"] < budget:
+            logger.info("ladder_falsefill_recheck", symbol=trade.symbol, tier=leg.get("index"),
+                        reason=reason, attempt=leg["recheck_count"], budget=budget,
+                        residual=round(residual, 10))
+            return
+        leg["recheck_exhausted"] = True
+        leg["filled"] = False
+        lapse = "" if protected else " [PROTECTION LAPSED: marching stop absent — escalated immediately]"
+        await self._risk_event(
+            db, "warning", "ladder_false_fill_rejected",
+            f"{trade.symbol} TP{leg.get('index')} status-filled but position qty uncorroborated "
+            f"after {leg['recheck_count']} check(s) ({reason}); NOT booked, slice -> closer{lapse}",
+            {"trade_id": trade.id, "symbol": trade.symbol, "tier": leg.get("index"),
+             "reason": reason, "claimed_filled_qty": round(float(filled_qty), 10),
+             "exchange_quantity": exchange_qty, "accounted_prior": round(accounted_prior, 10),
+             "original_position_qty": original_qty,
+             "unexplained_residual_qty": round(residual, 10),
+             "recheck_count": leg["recheck_count"], "budget": budget,
+             "protection_lapsed": not protected,
+             "timestamp": utc_now().isoformat()},
+        )
+
     async def _read_leg_terminal(
         self, adapter: ExchangeAdapter, symbol: str, leg: dict,
-    ) -> tuple[str, float, float]:
+    ) -> tuple[str, float | None, float | None]:
         """Fetch a leg's exchange status and normalize it. Returns
-        (status, fill_price, filled_qty). filled_qty falls back to the leg's slice
-        size for a whole FILLED order that does not report executedQty."""
-        status, fill_price, filled_qty = "resting", float(leg["price"]), float(leg["quantity"])
+        (status, fill_price, filled_qty).
+
+        Phase-2C TASK 1 — actual-only sourcing: price/qty come solely from the
+        adapter-normalized actual* fields (average_price == avgPrice|actualPrice,
+        filled_quantity == executedQty|actualQty). The old fallback to leg["price"]
+        (the TRIGGER) / leg["quantity"] is gone — a FILL status with no actual fill
+        data returns (status, None, None) so the caller treats it as UNVERIFIED and
+        never books a phantom fill at the trigger/mark (mark-at-detection forbidden)."""
+        fill_price: float | None = None
+        filled_qty: float | None = None
         try:
             order = await adapter.fetch_algo_order(symbol, leg["order_id"])
             status = classify_leg_status(order.status)
             if status in FILL_STATUSES:
                 if (order.average_price or 0) > 0:
                     fill_price = float(order.average_price)
-                if status == "partially_filled" and (order.filled_quantity or 0) > 0:
+                if (order.filled_quantity or 0) > 0:
                     filled_qty = float(order.filled_quantity)
-                elif (order.filled_quantity or 0) > 0:
-                    filled_qty = float(order.filled_quantity)
+            return status, fill_price, filled_qty
         except NotImplementedError:
-            status = "resting"  # adapter can't report -> do not infer a fill (INV-2)
+            return "resting", None, None  # adapter can't report -> do not infer a fill (INV-2)
         except Exception as exc:
             logger.debug("ladder_tier_fetch_failed", symbol=symbol, error=str(exc))
-            status = "resting"
-        return status, fill_price, filled_qty
+            return "resting", None, None
 
     async def _maybe_slippage_anomaly(self, db: AsyncSession, trade: Trade, leg: dict, fill_price: float) -> None:
         slippage_bps = abs(fill_price - float(leg["price"])) / max(float(leg["price"]), 1e-12) * 10_000
@@ -1762,10 +1848,12 @@ class BotRunner:
 
         # 1) Resolve every still-open slice leg from its terminal status (INV-2).
         for leg in tier_orders:
-            if not leg.get("order_id") or is_terminal_status(classify_leg_status(leg.get("status"))):
+            if (not leg.get("order_id")
+                    or is_terminal_status(classify_leg_status(leg.get("status")))
+                    or leg.get("recheck_exhausted")):   # rejected false-fill -> closer takes its slice
                 continue
             status, fill_price, filled_qty = await self._read_leg_terminal(adapter, trade.symbol, leg)
-            if status in FILL_STATUSES:
+            if status in FILL_STATUSES and fill_price is not None and filled_qty:
                 pnl = self._ladder_book_fill(trade, extra, leg,
                                              fill_price=fill_price, filled_qty=filled_qty, status=status)
                 if pnl is not None:
@@ -1777,7 +1865,7 @@ class BotRunner:
                          "pnl": round(pnl, 6)},
                     )
             else:
-                # Not filled -> a canceled/expired leg; its slice was taken by the closer.
+                # Not a verified fill (canceled/expired/unverified-no-actual) -> closer takes slice.
                 leg["status"] = status if status in CANCEL_STATUSES else "canceled"
                 leg["filled"] = False
 
@@ -1828,12 +1916,16 @@ class BotRunner:
         dispositions = round(slice_filled + max(0.0, closer_qty), 10)
         balanced = abs(dispositions - original_qty) <= max(1e-8, original_qty * 1e-6) and closer_qty >= -max(1e-8, original_qty * 1e-6)
         if not balanced:
+            # TASK 1 post-close INV-1 assertion: Σ(booked tier qty) + closer must
+            # reconstruct the original within tol; carry the explicit residual.
             await self._risk_event(
                 db, "warning", "ladder_sync_anomaly",
                 f"{trade.symbol} close ledger imbalance: dispositions={dispositions} original={original_qty}",
                 {"trade_id": trade.id, "symbol": trade.symbol,
                  "original_position_qty": original_qty, "slice_filled_qty": round(slice_filled, 10),
                  "closer_qty": closer_qty, "dispositions_total": dispositions,
+                 "unexplained_residual_qty": round(dispositions - original_qty, 10),
+                 "assertion": "inv1_close_ledger",
                  "close_reason": close_reason, "timestamp": utc_now().isoformat()},
             )
         await self._ladder_record_closed(db, trade, close_reason, balanced=balanced,
@@ -2250,10 +2342,11 @@ class BotRunner:
         self._record_closed_trade_outcome(trade)
         if not send_alert:
             return
-        alert_type = "stop_loss_hit" if reason == "stop_loss" else "take_profit_hit"
-        label = self._trade_assessment_label(trade)
-        await self.alerts.send(alert_type, f"{trade.symbol} closed by {reason} {label}")
-        await self.alerts.send("trade_closed", f"{trade.symbol} trade closed: {reason} {label}")
+        # TASK 3: ONE rich exit summary per trade (replaces the duplicate
+        # closed-by / trade-closed pair that carried entry score/grade/risk). The
+        # tier gradient is built ONLY from cross-checked booked fills (TASK 1), so
+        # it can never render a fill that didn't happen.
+        await self.alerts.send("trade_closed", self._build_exit_summary(trade, reason))
 
     def _record_closed_trade_outcome(self, trade: Trade) -> None:
         if not trade_counts_for_loss_streak(trade):
@@ -2750,6 +2843,46 @@ class BotRunner:
         if risk_pct is not None:
             parts.append(f"risk {float(risk_pct):.2f}%")
         return f"({' '.join(parts)})" if parts else ""
+
+    def _build_exit_summary(self, trade: Trade, reason: str) -> str:
+        """TASK 3: one per-trade exit summary — symbol/side, NET PnL ($ and %),
+        the realized tier gradient (each BOOKED tier only: label, qty, fill price,
+        % from entry, direction-aware), BE+ armed y/n, runner activated y/n, close
+        reason, hold time. Gradient comes from cross-checked fills (TASK 1) so it
+        never shows a fill that didn't happen. Deliberately omits entry
+        score/grade/risk (those belong to the entry alert, not the exit)."""
+        extra = trade.extra or {}
+        entry = float(trade.entry_price or 0.0)
+        pnl = float(trade.realized_pnl or 0.0)
+        orig_qty = float(extra.get("original_position_qty") or extra.get("original_quantity")
+                         or trade.quantity or 0.0)
+        notional = entry * orig_qty
+        pnl_pct = (pnl / notional * 100.0) if notional > 0 else 0.0
+        is_short = str(trade.side).lower() == "short"
+
+        def _from_entry(px: float) -> float:
+            if entry <= 0:
+                return 0.0
+            pct = (px - entry) / entry * 100.0
+            return -pct if is_short else pct
+
+        legs = []
+        for leg in (extra.get("tier_orders") or []):
+            if leg.get("filled") and leg.get("fill_price") is not None:
+                fp = float(leg["fill_price"])
+                legs.append(f"TP{leg.get('index')} {leg.get('filled_qty')}@{fp} ({_from_entry(fp):+.2f}%)")
+        if classify_leg_status(extra.get("runner_status")) in FILL_STATUSES and extra.get("runner_filled_qty"):
+            legs.append(f"runner {extra.get('runner_filled_qty')}")
+        gradient = " → ".join(legs) if legs else "no tier fills"
+
+        hold = ""
+        if trade.opened_at and trade.closed_at:
+            hold = f"{(trade.closed_at - trade.opened_at).total_seconds() / 60.0:.0f}m"
+        be = "Y" if extra.get("be_plus_armed") else "N"
+        runner = "Y" if extra.get("runner_active") else "N"
+        return (f"{trade.symbol} {str(trade.side).upper()} EXIT · {reason} · "
+                f"NET {pnl:+.2f} USDT ({pnl_pct:+.2f}%) · "
+                f"tiers: {gradient} · BE+ {be} · runner {runner} · hold {hold}")
 
     def _exit_pnl(self, trade: Trade, price: float, quantity: float) -> float:
         gross = (price - trade.entry_price) * quantity

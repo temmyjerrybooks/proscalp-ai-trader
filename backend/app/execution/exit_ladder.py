@@ -100,6 +100,24 @@ def _tier_price(entry: float, direction: str, atr: float, multiplier: float) -> 
     return float(base + move if direction == "long" else base - move)
 
 
+def _apply_move(entry: float, direction: str, move: Decimal) -> float:
+    """Price at a Decimal distance ``move`` from entry, on the take-profit side."""
+    base = Decimal(str(entry))
+    return float(base + move if direction == "long" else base - move)
+
+
+def _tier_price_floored(
+    entry: float, direction: str, atr: float, multiplier: float, min_distance_pct: float
+) -> float:
+    """Phase-2C TASK 2 cost-aware floor: tier price at max(multiplier*ATR,
+    min_distance_pct*entry) from entry. Used for the single-TP path; the multi-tier
+    loop in build_ladder_plan additionally enforces strict monotonicity across tiers
+    so a low-vol floor clamp can never collapse two tiers onto the same distance."""
+    move = max(Decimal(str(multiplier)) * Decimal(str(atr)),
+               Decimal(str(min_distance_pct)) * Decimal(str(entry)))
+    return _apply_move(entry, direction, move)
+
+
 def _pct_price(entry: float, offset: float, direction: str) -> float:
     """entry adjusted by a fractional offset, computed in Decimal."""
     factor = Decimal("1") + Decimal(str(offset)) if direction == "long" else Decimal("1") - Decimal(str(offset))
@@ -143,7 +161,8 @@ def build_ladder_plan(
 
     def _single(reason: str) -> LadderPlan:
         tp_price = _round_price(
-            _tier_price(entry_price, direction, effective_atr, multipliers[n_tiers - 1]),
+            _tier_price_floored(entry_price, direction, effective_atr,
+                                multipliers[n_tiers - 1], settings.tp_tier_min_distance_pct),
             rules,
         )
         return LadderPlan(
@@ -178,13 +197,26 @@ def build_ladder_plan(
 
     tiers: list[TierSpec] = []
     allocated = Decimal("0")
+    prev_move = Decimal("0")
+    min_move = Decimal(str(settings.tp_tier_min_distance_pct)) * Decimal(str(entry_price))
+    tick = Decimal(str(rules.tick_size)) if rules.tick_size > 0 else Decimal("0")
     for i in range(n_active_tiers):
         if full:
             raw_qty = quantity * size_pcts[i]
         else:
             raw_qty = quantity / best_c
         tier_qty = _round_qty(raw_qty, rules)
-        tier_price = _round_price(_tier_price(entry_price, direction, effective_atr, multipliers[i]), rules)
+        # Cost-aware floor + strict monotonicity (TASK 2): each tier sits at least
+        # min_distance_pct from entry AND strictly beyond the previous tier, so a
+        # low-vol floor clamp can't collapse two tiers onto the same distance
+        # (e.g. a floored TP1 must never meet TP2).
+        move = Decimal(str(multipliers[i])) * Decimal(str(effective_atr))
+        if move < min_move:
+            move = min_move
+        if move <= prev_move:
+            move = prev_move + (tick if tick > 0 else min_move)
+        prev_move = move
+        tier_price = _round_price(_apply_move(entry_price, direction, move), rules)
         tiers.append(TierSpec(index=i + 1, price=tier_price, quantity=tier_qty))
         allocated += Decimal(str(tier_qty))
 
@@ -378,6 +410,35 @@ def unexplained_residual_qty(
     return observed_decrease - accounted_filled_qty
 
 
+def qty_drop_corroborates(
+    *,
+    original_qty: float,
+    exchange_qty: float,
+    accounted_prior: float,
+    filled_qty: float,
+    tol_frac: float,
+) -> bool:
+    """Phase-2C TASK 1 qty-drop GATE. A FILL-status leg is corroborated only if the
+    live position has actually shed enough quantity to cover this fill on top of
+    everything already accounted:
+
+        observed_drop = original_qty - exchange_qty
+        required      = accounted_prior + filled_qty
+        corroborated  = observed_drop >= required - tol_frac * original_qty
+
+    ``accounted_prior`` is the Σ of fills booked BEFORE this leg, recomputed in the
+    same sequential booking section — so two legs resolved in one poll window can
+    never both book against the same observed_drop (the second sees the first's
+    qty already in accounted_prior). A status that reports FILLED while the position
+    has not dropped (observed_drop ~ 0) fails this and is rejected as a false fill
+    (INV-2 stays: status alone never books — status AND a corroborating qty drop)."""
+    if original_qty <= 0:
+        return False
+    observed_drop = original_qty - exchange_qty
+    required = accounted_prior + filled_qty
+    return observed_drop >= required - tol_frac * original_qty
+
+
 def classify_attach(
     *,
     stop_placed: bool,
@@ -407,9 +468,41 @@ def classify_attach(
     return "partial" if dropped > 0 else "full"
 
 
-def time_exit_decision(elapsed_seconds: float, partial_done: bool, settings: Settings) -> str | None:
-    """Return "full", "partial", or None based on elapsed time since entry."""
+def runner_still_favorable(
+    direction: str | None, mark_price: float | None, activation_price: float | None
+) -> bool:
+    """True when the mark is strictly beyond the runner's activation level in the
+    trade direction (long: mark > activation; short: mark < activation) — i.e. the
+    runner is still running our way at the instant the time-exit clock would fire.
+    Defensive on missing data: unknown -> not favorable (so we don't exempt blind)."""
+    if not direction or mark_price is None or activation_price is None or mark_price <= 0:
+        return False
+    return mark_price > activation_price if direction == "long" else mark_price < activation_price
+
+
+def time_exit_decision(
+    elapsed_seconds: float,
+    partial_done: bool,
+    settings: Settings,
+    *,
+    runner_active: bool = False,
+    mark_price: float | None = None,
+    runner_activation_price: float | None = None,
+    direction: str | None = None,
+) -> str | None:
+    """Return "full", "partial", or None based on elapsed time since entry.
+
+    Phase-2C TASK 2 — trail-aware exemption: at the ``time_exit_full`` mark, a
+    still-favorable ACTIVE runner (``runner_still_favorable``) is exempted from the
+    clock so the trailing stop can manage it — UNTIL ``time_exit_hard_ceiling_minutes``,
+    past which the position is force-closed regardless. The hard ceiling is checked
+    first so a sideways-bleeding runner the trail somehow misses can't live forever.
+    """
+    if elapsed_seconds >= settings.time_exit_hard_ceiling_minutes * 60:
+        return "full"
     if elapsed_seconds >= settings.time_exit_full_minutes * 60:
+        if runner_active and runner_still_favorable(direction, mark_price, runner_activation_price):
+            return None  # exempt; the trailing stop manages it until the hard ceiling
         return "full"
     if not partial_done and elapsed_seconds >= settings.time_exit_partial_minutes * 60:
         return "partial"

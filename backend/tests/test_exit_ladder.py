@@ -34,12 +34,12 @@ def test_full_ladder_four_tiers_plus_runner_long():
     assert plan.mode == "full"
     assert plan.is_ladder
     assert [t.index for t in plan.tiers] == [1, 2, 3, 4]
-    # tier prices = entry + mult*ATR for [0.3,0.6,1.0,1.6] * 10
-    assert [t.price for t in plan.tiers] == [1003.0, 1006.0, 1010.0, 1016.0]
+    # tier prices = entry + mult*ATR for the production tuple [0.6,1.0,1.5,2.0] * 10
+    assert [t.price for t in plan.tiers] == [1006.0, 1010.0, 1015.0, 1020.0]
     # 4 tiers @ 20% + runner 20%
     assert all(abs(t.quantity - 0.2) < 1e-9 for t in plan.tiers)
     assert abs(plan.runner_quantity - 0.2) < 1e-9
-    assert plan.runner_activation_price == 1016.0  # final tier price
+    assert plan.runner_activation_price == 1020.0  # final tier price
     assert plan.stop_price == 995.0
 
 
@@ -50,8 +50,8 @@ def test_full_ladder_short_side_prices_flip():
         atr=10.0, quantity=1.0, rules=_RULES,
     )
     assert plan.mode == "full"
-    assert [t.price for t in plan.tiers] == [997.0, 994.0, 990.0, 984.0]
-    assert plan.runner_activation_price == 984.0
+    assert [t.price for t in plan.tiers] == [994.0, 990.0, 985.0, 980.0]
+    assert plan.runner_activation_price == 980.0
 
 
 def test_min_notional_degrades_to_single_for_tiny_position():
@@ -97,8 +97,8 @@ def test_zero_atr_falls_back_to_risk_distance():
         settings=s, direction="long", entry_price=1000.0, stop_loss=990.0,
         atr=0.0, quantity=1.0, rules=_RULES,
     )
-    # effective unit = |entry-stop| = 10; tier1 = 1000 + 0.3*10 = 1003
-    assert plan.tiers[0].price == 1003.0
+    # effective unit = |entry-stop| = 10; tier1 = 1000 + 0.6*10 = 1006
+    assert plan.tiers[0].price == 1006.0
 
 
 # ---------------------------------------------------------------- runner_callback_rate

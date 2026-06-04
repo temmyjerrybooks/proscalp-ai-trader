@@ -51,8 +51,12 @@ class FakeExchange(ExchangeAdapter):
 
     async def fetch_order(self, symbol, order_id):
         avg = self._order_fills.get(order_id, 0.0)
+        # A filled tier carries real actual* data: status filled + filled_quantity
+        # (actualQty) + average_price (actualPrice). TASK 1 removed the leg-qty
+        # fallback (actual-only), so the fixture must report a real filled_quantity.
         return OrderResult(order_id, symbol, "filled" if avg else "new", "sell",
-                           "take_profit_market", 0.2, average_price=avg or None)
+                           "take_profit_market", 0.2,
+                           filled_quantity=(0.2 if avg else 0.0), average_price=avg or None)
 
     # Ladder lifecycle runs on algo endpoints; delegate to the regular fakes.
     async def fetch_open_algo_orders(self, symbol=None):
@@ -82,6 +86,11 @@ def _runner() -> BotRunner:
     s = Settings(
         trading_mode=TradingMode.TESTNET, market_type="futures",
         exchange_resting_exits_enabled=True, five_tier_ladder_enabled=True,
+        # Pin a fixed, floor-free geometry so these LOGIC/mechanics tests stay
+        # decoupled from production threshold tuning. The explicit _ladder_trade
+        # tier prices [1003,1006,1010,1016] == [0.3,0.6,1.0,1.6]xATR(10); the
+        # production tuple [0.6,1.0,1.5,2.0] is validated in the geometry tests.
+        tp_tier_atr_multipliers=[0.3, 0.6, 1.0, 1.6], tp_tier_min_distance_pct=0.0,
     )
     runner = BotRunner(settings=s)
     runner._risk_event = AsyncMock()
@@ -152,33 +161,42 @@ async def test_two_tiers_filled_books_pnl_and_advances_stop():
 
 
 @pytest.mark.asyncio
-async def test_sync_anomaly_fires_on_status_vs_position_disagreement():
+async def test_AC8_qtygate_rejects_uncorroborated_fill_and_escalates():
+    """TASK 1 / AC-8 — RED-FOR-THE-RIGHT-REASON. tp1 reports FILLED but the
+    position never sheds the qty. The qty-drop GATE must REJECT it — the OLD code
+    booked from status and only flagged a sync anomaly *after the fact*. It is NOT
+    booked; after N=ladder_falsefill_recheck_budget re-checks it escalates to a
+    typed ladder_false_fill_rejected carrying the residual. Crucially NO
+    ladder_tier_filled and NO ladder_sync_anomaly (nothing booked -> no
+    observational residual): the failure is on the qty-gate, not the old path."""
     runner = _runner()
-    trade = _ladder_trade(qty=1.0)  # original_position_qty baseline = 1.0
+    trade = _ladder_trade(qty=1.0)
     trade.extra["original_position_qty"] = 1.0
-    # tp1 reports FILLED (status-backed, 0.2 accounted) BUT the exchange still
-    # shows the FULL 1.0 position -> 0.2 was booked as filled that the position
-    # never shed. INV-4 residual = (1.0-1.0) - 0.2 = -0.2 -> |0.2|/1.0 = 20% fires.
+    # tp1 reports FILLED 0.2 every poll, but the position STAYS at 1.0 (never drops).
+    # mark == entry so the marching stop does not ratchet (the static fixture can't
+    # follow a place-new/cancel-old stop id); keeps the protection-present check True
+    # so the patient re-check runs to the full budget.
     adapter = FakeExchange(
-        positions=[Position("BTCUSDT", "long", 1.0, 1000.0, mark_price=1004.0)],
+        positions=[Position("BTCUSDT", "long", 1.0, 1000.0, mark_price=1000.0)],
         open_order_ids={"tp2", "tp3", "tp4", "run1", "sl1"},
         order_fills={"tp1": 1003.0},
     )
-    await runner._sync_ladder_trades(_db(), adapter, [trade])
+    budget = runner.settings.ladder_falsefill_recheck_budget
+    for _ in range(budget):
+        await runner._sync_ladder_trades(_db(), adapter, [trade])
 
     et = _event_types(runner)
-    # attribution STILL proceeds (observational only): tier booked from status
-    assert trade.extra["tier_orders"][0]["filled"] is True
-    assert trade.realized_pnl > 0
-    assert "ladder_tier_filled" in et
-    assert "ladder_sync_anomaly" in et
+    assert trade.extra["tier_orders"][0]["filled"] is False   # GATE rejected -> never booked
+    assert trade.realized_pnl == 0.0
+    assert "ladder_tier_filled" not in et
+    assert "ladder_sync_anomaly" not in et                    # nothing booked -> no residual
+    assert "ladder_false_fill_rejected" in et                 # escalated on budget exhaustion
     payload = next(c.args[4] for c in runner._risk_event.await_args_list
-                   if c.args[2] == "ladder_sync_anomaly")
+                   if c.args[2] == "ladder_false_fill_rejected")
+    assert payload["reason"] == "qty_drop_not_corroborated"
     assert payload["unexplained_residual_qty"] == pytest.approx(-0.2)
-    assert payload["original_position_qty"] == 1.0
-    assert payload["exchange_quantity"] == 1.0
-    assert payload["accounted_filled_qty"] == pytest.approx(0.2)
-    assert payload["drift_pct"] == pytest.approx(20.0)
+    assert payload["recheck_count"] == budget
+    assert payload["protection_lapsed"] is False              # marching stop ("sl1") present
     assert "timestamp" in payload
 
 

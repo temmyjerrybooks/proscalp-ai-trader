@@ -10,7 +10,7 @@ INV-4  anomaly == unexplained residual / original_position_qty
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -387,6 +387,90 @@ async def test_finished_runner_attributes_as_runner_close():
     assert "ladder_sync_anomaly" not in _events(runner)
 
 
+# ===== TASK 1 negative-direction cases =====
+
+# AC-8 TWIN — the position DID shed the slice (1.0 -> 0.8) but tp1 reports a FILL
+# status with NO actual* data (actualPrice/actualQty null). actual-only refuses to
+# book it at the trigger/mark; the real drop surfaces as an INV-4 residual mid-life,
+# and at close the unbooked slice is attributed to the CLOSER so the ledger still
+# balances (INV-1) -> proves the actual-only path leaves no real fill UNATTRIBUTED
+# (it lands on the closer, never a phantom tier price).
+@pytest.mark.asyncio
+async def test_AC8_twin_unverified_fill_no_actual_falls_to_closer():
+    runner = _runner()
+    trade = _trade(qty=0.8, original_qty=1.0,
+                   tiers=[_leg(1, "tp1", 1003.0, 0.2), _leg(2, "tp2", 1006.0, 0.2)])
+    adapter = ReconcileFake(
+        positions=[Position("BTCUSDT", "long", 0.8, 1000.0, mark_price=1004.0)],
+        open_algo_ids={"tp2", "run1", "sl1"},
+        order_status={"tp1": {"status": "FINISHED"}},   # actual_price/qty omitted -> None
+    )
+    await runner._sync_ladder_trades(_db(), adapter, [trade])
+    assert trade.extra["tier_orders"][0]["filled"] is False        # NOT booked (no actual*)
+    assert "ladder_tier_filled" not in _events(runner)
+    assert "ladder_sync_anomaly" in _events(runner)                # real drop, unexplained
+    # close: the unbooked slice is absorbed by the closer; ledger balances (INV-1).
+    adapter._positions = []
+    await runner._sync_ladder_trades(_db(), adapter, [trade])
+    closed = _payload(runner, "ladder_trade_closed")
+    assert closed["ledger_balanced"] is True                       # no real fill lost
+    assert closed["slice_filled_qty"] == pytest.approx(0.0)        # tp1 never a booked tier
+    assert closed["closer_qty"] == pytest.approx(1.0)              # full original to the closer
+
+
+# RE-CHECK / PARTIAL CORROBORATION — a leg PARTIALLY_FILLED for 0.1 that the
+# position corroborates (drop 0.1) books exactly 0.1; the uncorroborated remainder
+# of that tier is NOT re-booked — at close the CLOSER absorbs it. Sigma(booked) +
+# closer == original, with the corroborated slice counted ONCE (no double-count).
+@pytest.mark.asyncio
+async def test_partial_corroboration_books_once_no_double_count():
+    runner = _runner()
+    trade = _trade(qty=0.9, original_qty=1.0,
+                   tiers=[_leg(1, "tp1", 1003.0, 0.2), _leg(2, "tp2", 1006.0, 0.2)])
+    adapter = ReconcileFake(
+        positions=[Position("BTCUSDT", "long", 0.9, 1000.0, mark_price=1004.0)],
+        open_algo_ids={"tp2", "run1", "sl1"},
+        order_status={"tp1": {"status": "PARTIALLY_FILLED", "actual_price": 1003.0, "actual_qty": 0.1}},
+    )
+    await runner._sync_ladder_trades(_db(), adapter, [trade])
+    assert trade.extra["tier_orders"][0]["filled_qty"] == pytest.approx(0.1)  # corroborated partial
+    assert "ladder_sync_anomaly" not in _events(runner)            # 0.1 booked == 0.1 shed
+    adapter._positions = []
+    await runner._sync_ladder_trades(_db(), adapter, [trade])
+    closed = _payload(runner, "ladder_trade_closed")
+    assert closed["slice_filled_qty"] == pytest.approx(0.1)        # booked once
+    assert closed["closer_qty"] == pytest.approx(0.9)              # 1.0 - 0.1, no re-count
+    assert closed["ledger_balanced"] is True
+
+
+# TASK 3 — ONE rich exit summary: PnL (not entry score/grade/risk), gradient built
+# only from BOOKED fills, single trade_closed alert (no duplicate closed-by pair).
+@pytest.mark.asyncio
+async def test_exit_summary_single_alert_gradient_from_booked_only():
+    runner = _runner()
+    trade = _trade(qty=0.4, original_qty=1.0, tiers=[
+        _leg(1, "tp1", 1003.0, 0.2, status="filled", filled_qty=0.2),
+        _leg(2, "tp2", 1006.0, 0.2),  # UNfilled -> must not appear in the gradient
+    ])
+    trade.extra.update({"grade": "A", "setup_score": 88, "risk_pct": 0.25, "be_plus_armed": True})
+    trade.extra["tier_orders"][0]["fill_price"] = 1003.0
+    trade.realized_pnl = 0.6
+    trade.closed_at = trade.opened_at + timedelta(minutes=12)
+    summary = runner._build_exit_summary(trade, "trailing_runner_exchange")
+    assert "TP1" in summary and "1003.0" in summary                # booked tier appears
+    assert "TP2" not in summary                                    # unfilled tier excluded
+    assert "NET" in summary and "0.6" in summary                   # PnL present
+    for forbidden in ("grade", "score", "risk"):
+        assert forbidden not in summary                            # entry context dropped
+    assert "BE+ Y" in summary and "hold 12m" in summary
+    # single trade_closed alert via the real finalize path (no duplicate pair)
+    runner.alerts.send.reset_mock()
+    await runner._finalize_trade_close(_db(), trade, 1003.0, "trailing_runner_exchange")
+    sent = [c.args[0] for c in runner.alerts.send.await_args_list]
+    assert sent.count("trade_closed") == 1
+    assert "stop_loss_hit" not in sent and "take_profit_hit" not in sent
+
+
 # ----- Item 2 <-> 1/3/4 integration: concurrent attach feeds the pipeline -----
 
 from app.execution.order_manager import OrderManager  # noqa: E402
@@ -499,7 +583,8 @@ async def _attach_then_close(runner, adapter):
 @pytest.mark.asyncio
 async def test_IT2_1a_2021_subset_balances_and_full():
     runner = _runner()
-    adapter = AttachCloseFake(raise_2021_on_prices={1001.5, 1003.0})
+    # New geometry [0.6,1.0,1.5,2.0]xATR(5.0): tier1=1003.0, tier2=1005.0.
+    adapter = AttachCloseFake(raise_2021_on_prices={1003.0, 1005.0})
     trade, bucket = await _attach_then_close(runner, adapter)
     assert bucket == "full"
     assert trade.status == "closed"
@@ -512,7 +597,7 @@ async def test_IT2_1a_2021_subset_balances_and_full():
 @pytest.mark.asyncio
 async def test_IT2_1b_hard_drop_balances_and_partial():
     runner = _runner()
-    adapter = AttachCloseFake(hard_fail_on_prices={1001.5})
+    adapter = AttachCloseFake(hard_fail_on_prices={1003.0})  # new tier1 = 0.6xATR(5.0)
     trade, bucket = await _attach_then_close(runner, adapter)
     assert bucket == "partial"
     assert trade.status == "closed"
@@ -524,7 +609,7 @@ async def test_IT2_1b_hard_drop_balances_and_partial():
 @pytest.mark.asyncio
 async def test_IT2_2_dropped_tier_never_phantom_fill():
     runner = _runner()
-    adapter = AttachCloseFake(hard_fail_on_prices={1001.5})  # tier1 (1001.5) dropped
+    adapter = AttachCloseFake(hard_fail_on_prices={1003.0})  # tier1 (1003.0) dropped
     trade, _ = await _attach_then_close(runner, adapter)
     indices = [t["index"] for t in trade.extra.get("tier_orders", [])]
     assert 1 not in indices  # dropped tier has no leg in the placed_set
