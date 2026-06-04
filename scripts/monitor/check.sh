@@ -137,7 +137,7 @@ SELECT
   (SELECT COUNT(*) FROM risk_events WHERE event_type='protective_orders_failed' AND created_at >= now() - interval '16 minutes')
 ")
 IFS='|' read SYNC_ANOM C1_TRIP C2_TRIP PARTIAL PROT_FAIL <<< "$LADDER"
-[ "${SYNC_ANOM:-0}" -gt 0 ] 2>/dev/null && send_alert "🔴 ladder_sync_anomaly x${SYNC_ANOM} in last 15m — UNATTRIBUTED RESIDUAL (the reconciler bug class; halt+investigate)" "ladder_sync_anomaly"
+[ "${SYNC_ANOM:-0}" -gt 0 ] 2>/dev/null && send_alert "🔴 ladder_sync_anomaly x${SYNC_ANOM} in last 15m — UNATTRIBUTED RESIDUAL (reconciler bug class; INVESTIGATE — non-halting tripwire, the bot keeps running)" "ladder_sync_anomaly"
 [ "${C1_TRIP:-0}" -gt 0 ] 2>/dev/null && send_alert "🔴 C1 breaker tripped (protective_orders_circuit_breaker) x${C1_TRIP} — resting path disabled" "c1_breaker"
 [ "${C2_TRIP:-0}" -gt 0 ] 2>/dev/null && send_alert "🔴 C2 breaker tripped (ladder partial-attach rate) x${C2_TRIP} — ladder auto-disabled" "c2_breaker"
 [ "${PARTIAL:-0}" -gt 0 ] 2>/dev/null && send_alert "⚠️ ladder_partial_attach (degraded/dropped tiers) x${PARTIAL} in last 15m" "ladder_partial_attach"
