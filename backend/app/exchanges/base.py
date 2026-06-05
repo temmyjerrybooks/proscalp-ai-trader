@@ -226,6 +226,16 @@ class ExchangeAdapter(ABC):
         """List currently-open algo orders (for tier-fill detection + reconciliation)."""
         raise NotImplementedError(f"{self.name} adapter does not implement fetch_open_algo_orders")
 
+    async def fetch_user_trades(
+        self, symbol: str, start_ms: int | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Account trade list — the exchange's own settled fills with realizedPnl +
+        commission. Phase-2C: this is the AUTHORITATIVE source for exit
+        reconciliation, replacing inference from the eventually-consistent algo
+        order-status surface. Returns raw fill dicts; adapters that support it
+        (Binance) override."""
+        raise NotImplementedError(f"{self.name} adapter does not implement fetch_user_trades")
+
     async def get_fees(self, symbol: str) -> dict[str, float]:
         return {"maker_bps": 2.0, "taker_bps": 6.0}
 

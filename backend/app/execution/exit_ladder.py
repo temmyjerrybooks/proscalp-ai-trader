@@ -439,6 +439,105 @@ def qty_drop_corroborates(
     return observed_drop >= required - tol_frac * original_qty
 
 
+# ---------------------------------------------------------------------------
+# Phase-2C authoritative reconciliation from userTrades (the exchange's own fill
+# ledger). This REPLACES inference from the eventually-consistent algo-order
+# status surface (fetch_algo_order / fetch_open_algo_orders), which conflated
+# "gone because FILLED" with "-2013 can't read" and oscillated between over- and
+# under-booking. These functions are pure + side-effect-free (unit-tested).
+# ---------------------------------------------------------------------------
+
+def split_user_trades(
+    rows: list[dict], *, entry_side: str, quote_asset: str = "USDT"
+) -> dict:
+    """Split raw Binance USDⓈ-M ``GET /fapi/v1/userTrades`` rows for ONE position
+    into entry vs reducing fills and aggregate the authoritative ledger.
+
+    ``entry_side`` is the position-OPENING side: ``SELL`` for a short, ``BUY`` for
+    a long. Reducing fills are the opposite side. realized PnL is Binance-computed
+    (``realizedPnl``, gross of fees); commission is summed over EVERY fill (entry +
+    exits) so ``net_pnl`` is the true round-trip exchange net.
+
+    Returns a dict:
+      entry_qty, exit_qty          — Σ qty by role (the conservation operands)
+      realized_pnl_gross           — Σ realizedPnl over reducing fills
+      commission                   — Σ commission paid in ``quote_asset``
+      commission_nonquote          — Σ commission paid in any OTHER asset (NOT
+                                     netted — flagged so a BNB-fee settle can't
+                                     silently corrupt the USDT net)
+      net_pnl                      — realized_pnl_gross − commission
+      reduce_fills                 — [{order_id, price, qty, realized_pnl, time}]
+                                     in input order (for gradient mapping + audit)
+    """
+    es = (entry_side or "").upper()
+    entry_qty = 0.0
+    exit_qty = 0.0
+    realized = 0.0
+    commission_quote = 0.0
+    commission_nonquote = 0.0
+    reduce_fills: list[dict] = []
+    for r in rows:
+        side = str(r.get("side", "")).upper()
+        qty = float(r.get("qty") or r.get("quantity") or 0.0)
+        comm = float(r.get("commission") or 0.0)
+        casset = str(r.get("commissionAsset") or "")
+        if casset == quote_asset:
+            commission_quote += comm
+        elif comm:
+            commission_nonquote += comm
+        if side == es:
+            entry_qty += qty
+        else:
+            rpnl = float(r.get("realizedPnl") or 0.0)
+            exit_qty += qty
+            realized += rpnl
+            reduce_fills.append({
+                "order_id": str(r.get("orderId") or ""),
+                "price": float(r.get("price") or 0.0),
+                "qty": qty,
+                "realized_pnl": rpnl,
+                "time": int(r.get("time") or 0),
+            })
+    return {
+        "entry_qty": round(entry_qty, 12),
+        "exit_qty": round(exit_qty, 12),
+        "realized_pnl_gross": round(realized, 10),
+        "commission": round(commission_quote, 10),
+        "commission_nonquote": round(commission_nonquote, 10),
+        "net_pnl": round(realized - commission_quote, 10),
+        "reduce_fills": reduce_fills,
+    }
+
+
+def conservation_status(
+    base_qty: float, exit_qty: float, position_qty: float, tol_frac: float
+) -> tuple[str, float]:
+    """Authoritative conservation law for a ladder position reconciled from
+    userTrades. With ``base_qty`` = Σ entry fills, ``exit_qty`` = Σ reducing fills,
+    and ``position_qty`` = the live exchange remainder, the identity is::
+
+        base_qty == exit_qty + position_qty
+
+    Returns ``(status, residual)`` where ``residual = base_qty - position_qty -
+    exit_qty``:
+
+      - ``ok``        : ``|residual| <= tol_frac*base_qty`` — everything reconciles.
+      - ``shortfall`` : ``residual > tol`` — quantity left the position that
+        userTrades has not surfaced YET (eventual-consistency lag). This SELF-HEALS
+        once the fill posts, so callers grace it with a bounded re-check rather than
+        alarming (the crucial difference from the ``-2013`` read that NEVER healed).
+      - ``overcount`` : ``residual < -tol`` — more reducing qty than the position
+        actually shed. Impossible for one position from its own fills → a genuine
+        mismatch, alarm immediately.
+    """
+    if base_qty <= 0:
+        return "ok", 0.0
+    residual = base_qty - position_qty - exit_qty
+    if abs(residual) <= tol_frac * base_qty:
+        return "ok", round(residual, 12)
+    return ("shortfall" if residual > 0 else "overcount"), round(residual, 12)
+
+
 def classify_attach(
     *,
     stop_placed: bool,

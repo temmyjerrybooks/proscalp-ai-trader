@@ -8,10 +8,89 @@ from app.execution.exit_ladder import (
     SymbolRules,
     build_ladder_plan,
     compute_target_stop,
+    conservation_status,
     runner_callback_rate,
     should_arm_be_plus,
+    split_user_trades,
     time_exit_decision,
 )
+
+
+def _ut(side, price, qty, realized=0.0, comm=0.0, asset="USDT"):
+    return {"side": side, "price": str(price), "qty": str(qty),
+            "realizedPnl": str(realized), "commission": str(comm), "commissionAsset": asset}
+
+
+# ----------------------------------------------------- split_user_trades (Phase-2C)
+
+def test_split_user_trades_short_entry_sell_exits_buy():
+    rows = [
+        _ut("SELL", 100.0, 1.0, 0.0, 0.06),       # entry (short)
+        _ut("BUY", 99.0, 0.5, 0.5, 0.03),          # exit
+        _ut("BUY", 98.0, 0.5, 1.0, 0.03),          # exit
+    ]
+    r = split_user_trades(rows, entry_side="SELL")
+    assert r["entry_qty"] == pytest.approx(1.0)
+    assert r["exit_qty"] == pytest.approx(1.0)
+    assert r["realized_pnl_gross"] == pytest.approx(1.5)
+    assert r["commission"] == pytest.approx(0.12)       # ALL fills' commission
+    assert r["net_pnl"] == pytest.approx(1.38)          # 1.5 − 0.12
+    assert len(r["reduce_fills"]) == 2
+
+
+def test_split_user_trades_long_entry_buy_exits_sell():
+    rows = [_ut("BUY", 100.0, 2.0, 0.0, 0.1), _ut("SELL", 101.0, 2.0, 2.0, 0.1)]
+    r = split_user_trades(rows, entry_side="BUY")
+    assert r["entry_qty"] == pytest.approx(2.0)
+    assert r["exit_qty"] == pytest.approx(2.0)
+    assert r["net_pnl"] == pytest.approx(1.8)           # 2.0 − 0.2
+
+
+def test_split_user_trades_nonquote_commission_tracked_not_netted():
+    rows = [_ut("BUY", 100.0, 1.0, 0.0, 0.0005, asset="BNB"),
+            _ut("SELL", 102.0, 1.0, 2.0, 0.1, asset="USDT")]
+    r = split_user_trades(rows, entry_side="BUY", quote_asset="USDT")
+    assert r["commission"] == pytest.approx(0.1)         # only the USDT fee
+    assert r["commission_nonquote"] == pytest.approx(0.0005)
+    assert r["net_pnl"] == pytest.approx(1.9)            # BNB fee NOT subtracted
+
+
+def test_split_user_trades_one_order_multiple_partial_fills_summed():
+    rows = [_ut("BUY", 100.0, 1.0, 0.0), _ut("SELL", 101.0, 0.6, 0.6),
+            _ut("SELL", 101.0, 0.4, 0.4)]
+    r = split_user_trades(rows, entry_side="BUY")
+    assert r["exit_qty"] == pytest.approx(1.0)
+    assert r["realized_pnl_gross"] == pytest.approx(1.0)
+
+
+# ----------------------------------------------------- conservation_status (Phase-2C)
+
+def test_conservation_ok():
+    status, resid = conservation_status(1.0, 0.4, 0.6, 0.05)
+    assert status == "ok" and abs(resid) < 1e-9
+
+
+def test_conservation_shortfall_when_fills_not_yet_surfaced():
+    # position dropped to 0.8 but only 0.0 exit booked -> 0.2 shortfall
+    status, resid = conservation_status(1.0, 0.0, 0.8, 0.05)
+    assert status == "shortfall"
+    assert resid == pytest.approx(0.2)
+
+
+def test_conservation_overcount_when_more_exit_than_shed():
+    # base 1.0, position 0.8 -> only 0.2 could exit, but 0.4 booked
+    status, resid = conservation_status(1.0, 0.4, 0.8, 0.05)
+    assert status == "overcount"
+    assert resid == pytest.approx(-0.2)
+
+
+def test_conservation_tolerance_absorbs_rounding():
+    status, _ = conservation_status(1.0, 0.39, 0.6, 0.05)  # 0.01 within 5%
+    assert status == "ok"
+
+
+def test_conservation_zero_base_is_ok():
+    assert conservation_status(0.0, 0.0, 0.0, 0.05)[0] == "ok"
 
 
 def _settings(**kw) -> Settings:

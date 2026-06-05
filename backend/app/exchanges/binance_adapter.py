@@ -379,6 +379,21 @@ class BinanceAdapter(ExchangeAdapter):
         items = raw if isinstance(raw, list) else raw.get("orders", []) if isinstance(raw, dict) else []
         return [self._algo_result(item, symbol=item.get("symbol", symbol or "")) for item in items]
 
+    async def fetch_user_trades(
+        self, symbol: str, start_ms: int | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        # Account trade list — the authoritative settled-fill ledger (price, qty,
+        # realizedPnl, commission, orderId, side, time). Reliable signed endpoint;
+        # NOT the eventually-consistent algo surface. Phase-2C exit reconciliation
+        # is driven from here. Returns the raw list as Binance returns it.
+        if not self.futures:
+            raise NotImplementedError("user trades are futures-only")
+        params: dict[str, Any] = {"symbol": symbol, "limit": int(limit)}
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        raw = await self._signed_request("GET", "/fapi/v1/userTrades", params=params)
+        return raw if isinstance(raw, list) else []
+
     async def fetch_open_orders(self, symbol: str | None = None) -> list[OrderResult]:
         path = "/fapi/v1/openOrders" if self.futures else "/api/v3/openOrders"
         params = {"symbol": symbol} if symbol else {}

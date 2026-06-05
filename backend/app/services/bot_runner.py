@@ -33,9 +33,11 @@ from app.execution.exit_ladder import (
     classify_attach,
     classify_leg_status,
     compute_target_stop,
+    conservation_status,
     is_terminal_status,
     qty_drop_corroborates,
     should_arm_be_plus,
+    split_user_trades,
     time_exit_decision,
     unexplained_residual_qty,
 )
@@ -1519,14 +1521,19 @@ class BotRunner:
         was finalized (closed) this cycle, so the caller skips the extra write."""
         atr = float(extra.get("entry_atr") or 0.0) or abs(trade.entry_price - trade.stop_loss)
 
-        # 1) Attribute tier fills from terminal STATUS (INV-2), then run the
-        #    INV-4 unexplained-residual tripwire against the live exchange qty.
-        await self._ladder_attribute_open(db, adapter, trade, extra, float(position.quantity))
+        # 1) AUTHORITATIVE reconciliation from userTrades (Phase-2C): book realized
+        #    PnL + exit qty from the exchange's own settled fills, run the
+        #    conservation invariant, and emit per-fill audit. Replaces inference
+        #    from the eventually-consistent algo-order status surface.
+        rec = await self._ladder_reconcile(db, adapter, trade, extra, float(position.quantity))
+        # tiers_filled for the stop ladder: derive from qty actually EXITED
+        # (runner-exclusive), not from status reads.
         tier_orders = extra.get("tier_orders") or []
-        tiers_filled = sum(1 for t in tier_orders if t.get("filled"))
+        exit_qty = float((rec or {}).get("exit_qty") or 0.0)
+        tiers_total = len(tier_orders) or len(self.settings.tp_tier_atr_multipliers)
+        tiers_filled = self._tiers_filled_from_qty(exit_qty, self._nominal_tier_qty(extra), tiers_total)
         extra["tiers_filled"] = tiers_filled
-        # Keep trade.quantity synced to the exchange remainder so finalize_close
-        # prices only the un-realized chunk (filled tiers already booked).
+        # Keep trade.quantity synced to the exchange remainder.
         trade.quantity = float(position.quantity)
         extra["remaining_quantity"] = float(position.quantity)
 
@@ -1639,10 +1646,194 @@ class BotRunner:
             total += float(extra.get("runner_filled_qty") or extra.get("runner_quantity") or 0.0)
         return total
 
+    # ----- Phase-2C: AUTHORITATIVE reconciliation from userTrades -----
+    # The exchange's own settled-fill ledger is the source of truth for realized
+    # PnL and exited quantity. This replaces inference from the eventually-
+    # consistent algo-order status surface (fetch_algo_order / fetch_open_algo_
+    # orders), whose -2013 "Order does not exist" on a purged-but-FILLED tier was
+    # swallowed as "resting" -> permanent under-attribution -> false sync_anomaly.
+
+    @staticmethod
+    def _nominal_tier_qty(extra: dict) -> float:
+        """Per-tier quantity (tiers are equal-sized); min() guards against runner
+        contamination. Falls back to 20% of base if no tier legs are recorded."""
+        tiers = extra.get("tier_orders") or []
+        qs = [float(t.get("quantity") or 0.0) for t in tiers if float(t.get("quantity") or 0.0) > 0]
+        if qs:
+            return min(qs)
+        base = float(extra.get("original_position_qty") or extra.get("ut_entry_qty") or 0.0)
+        return base * 0.2 if base else 0.0
+
+    @staticmethod
+    def _tiers_filled_from_qty(exit_qty: float, tier_qty: float, tiers_total: int) -> int:
+        """How many TP tiers' worth of quantity has EXITED (runner-exclusive),
+        clamped to the tier count — the input to the stop ladder. Derived from real
+        exited qty, not from status reads."""
+        if tier_qty <= 0:
+            return 0
+        return max(0, min(int(exit_qty / tier_qty + 1e-9), tiers_total))
+
+    @staticmethod
+    def _map_fills_to_tiers(extra: dict, reduce_fills: list[dict]) -> None:
+        """DISPLAY-ONLY gradient mapping: best-effort assign reducing fills to tier
+        legs by nearest trigger price. PnL/qty accounting NEVER depends on this — a
+        mislabeled tier is a cosmetic nit, not an anomaly. Leftover fills (runner /
+        deeper close) roll into the runner display."""
+        tiers = extra.get("tier_orders") or []
+        used: set[int] = set()
+        for leg in tiers:
+            tp = float(leg.get("price") or 0.0)
+            best_i = None
+            best_d = None
+            for i, f in enumerate(reduce_fills):
+                if i in used:
+                    continue
+                d = abs(float(f["price"]) - tp)
+                if best_d is None or d < best_d:
+                    best_d, best_i = d, i
+            if best_i is not None:
+                f = reduce_fills[best_i]
+                used.add(best_i)
+                leg["filled"] = True
+                leg["filled_qty"] = f["qty"]
+                leg["fill_price"] = f["price"]
+                leg["realized_pnl"] = round(f["realized_pnl"], 6)
+                leg["status"] = "filled"
+        leftover = [reduce_fills[i] for i in range(len(reduce_fills)) if i not in used]
+        if leftover:
+            extra["runner_status"] = "filled"
+            extra["runner_filled_qty"] = round(sum(float(f["qty"]) for f in leftover), 10)
+
+    async def _ladder_reconcile(
+        self, db: AsyncSession, adapter: ExchangeAdapter, trade: Trade, extra: dict,
+        position_qty: float, *, closing: bool = False,
+    ) -> dict | None:
+        """Overwrite trade.realized_pnl with the true exchange net from userTrades
+        (Σ realizedPnl − Σ commission), derive exited qty, run the conservation
+        invariant, and emit per-fill audit + the display gradient. Returns the
+        reconcile dict, or None when the source is unavailable / there were no new
+        exits this cycle (caller keeps the last good accounting)."""
+        if self.settings.trading_mode == TradingMode.PAPER:
+            return None
+        # Fetch only when something could have changed: first look, a position
+        # DECREASE, a pending lag re-check, or a close — otherwise reuse the last
+        # good accounting (no new fills could have settled).
+        last_pos = extra.get("ut_last_pos")
+        have_prior = extra.get("ut_seen_orders") is not None
+        pending_lag = int(extra.get("ut_recheck", 0)) > 0
+        if (not closing and have_prior and last_pos is not None and not pending_lag
+                and position_qty >= float(last_pos) - 1e-12):
+            extra["ut_last_pos"] = position_qty
+            return {
+                "exit_qty": float(extra.get("ut_exit_qty") or 0.0),
+                "base_qty": float(extra.get("ut_entry_qty") or extra.get("original_position_qty") or 0.0),
+                "net_pnl": float(extra.get("ut_net_pnl") or trade.realized_pnl or 0.0),
+                "reduce_fills": [],
+            }
+        extra["ut_last_pos"] = position_qty
+
+        start_ms = extra.get("ut_since_ms")
+        if not start_ms:
+            opened = trade.opened_at
+            base_ts = opened.timestamp() if opened else datetime.now(timezone.utc).timestamp()
+            start_ms = int(base_ts * 1000) - 2000  # small buffer to capture the entry fill
+            extra["ut_since_ms"] = start_ms
+
+        entry_side = "SELL" if str(trade.side).lower() == "short" else "BUY"
+        rec: dict | None = None
+        attempts = int(self.settings.ladder_falsefill_recheck_budget) if closing else 1
+        for attempt in range(max(1, attempts)):
+            try:
+                rows = await adapter.fetch_user_trades(trade.symbol, start_ms=start_ms)
+            except NotImplementedError:
+                return None
+            except Exception as exc:
+                logger.warning("ladder_usertrades_fetch_failed", symbol=trade.symbol, error=str(exc))
+                return None
+            rec = split_user_trades(rows, entry_side=entry_side, quote_asset=self.settings.quote_asset)
+            if closing:
+                # The just-settled close fill can lag in userTrades; retry briefly so
+                # finalize reconciles against the COMPLETE ledger (not a short read).
+                base_try = rec["entry_qty"] or float(extra.get("original_position_qty") or trade.quantity or 0.0)
+                status, _ = conservation_status(
+                    base_try, rec["exit_qty"], position_qty, self.settings.ladder_qty_gate_tol_pct
+                )
+                if status == "shortfall" and attempt + 1 < max(1, attempts):
+                    await asyncio.sleep(1.0)
+                    continue
+            break
+
+        assert rec is not None
+        base = rec["entry_qty"] or float(extra.get("original_position_qty") or trade.quantity or 0.0)
+
+        # Authoritative realized PnL — overwrite (idempotent full recompute).
+        trade.realized_pnl = round(rec["net_pnl"], 8)
+        extra["ut_net_pnl"] = round(rec["net_pnl"], 8)
+        extra["ut_exit_qty"] = rec["exit_qty"]
+        extra["ut_entry_qty"] = rec["entry_qty"]
+        if rec["commission_nonquote"]:
+            logger.warning("ladder_commission_nonquote", symbol=trade.symbol,
+                           amount=rec["commission_nonquote"])
+
+        # Per-fill audit (dedup by child orderId) + display gradient.
+        seen = set(extra.get("ut_seen_orders") or [])
+        newly = [f for f in rec["reduce_fills"] if f["order_id"] and f["order_id"] not in seen]
+        if newly:
+            self._map_fills_to_tiers(extra, rec["reduce_fills"])
+            for f in newly:
+                seen.add(f["order_id"])
+                await self._risk_event(
+                    db, "info", "ladder_tier_filled",
+                    f"{trade.symbol} exit fill {f['qty']}@{f['price']} "
+                    f"(realizedPnl {f['realized_pnl']:+.4f})",
+                    {"trade_id": trade.id, "symbol": trade.symbol, "order_id": f["order_id"],
+                     "fill_price": f["price"], "quantity": f["qty"],
+                     "realized_pnl": round(f["realized_pnl"], 6), "source": "userTrades"},
+                )
+        extra["ut_seen_orders"] = sorted(seen)
+
+        await self._ladder_conservation_check(
+            db, trade, extra, base, rec["exit_qty"], position_qty, closing=closing
+        )
+        return {**rec, "base_qty": base}
+
+    async def _ladder_conservation_check(
+        self, db: AsyncSession, trade: Trade, extra: dict,
+        base: float, exit_qty: float, position_qty: float, *, closing: bool,
+    ) -> None:
+        """New tripwire: userTrades conservation ``base == exit_qty + position_qty``.
+        A SHORTFALL (fills not yet surfaced) self-heals, so it's graced by a bounded
+        re-check; an OVERCOUNT — or a shortfall that persists past budget / at close
+        — is a real mismatch -> ladder_sync_anomaly."""
+        status, residual = conservation_status(
+            base, exit_qty, position_qty, self.settings.ladder_qty_gate_tol_pct
+        )
+        if status == "ok":
+            extra["ut_recheck"] = 0
+            return
+        if status == "shortfall" and not closing:
+            extra["ut_recheck"] = int(extra.get("ut_recheck", 0)) + 1
+            if extra["ut_recheck"] < int(self.settings.ladder_falsefill_recheck_budget):
+                logger.info("ladder_conservation_lag", symbol=trade.symbol,
+                            residual=round(residual, 10), attempt=extra["ut_recheck"],
+                            budget=self.settings.ladder_falsefill_recheck_budget)
+                return
+        await self._risk_event(
+            db, "warning", "ladder_sync_anomaly",
+            f"{trade.symbol} userTrades conservation {status}: residual {residual:.10f} "
+            f"(base={base} exit_qty={exit_qty} position={position_qty})",
+            {"trade_id": trade.id, "symbol": trade.symbol, "kind": status,
+             "residual_qty": round(residual, 10), "base_qty": base, "exit_qty": exit_qty,
+             "position_qty": position_qty, "recheck_count": int(extra.get("ut_recheck", 0)),
+             "closing": closing, "assertion": "usertrades_conservation",
+             "timestamp": utc_now().isoformat()},
+        )
+        extra["ut_recheck"] = 0
+
     async def _ladder_attribute_open(
         self, db: AsyncSession, adapter: ExchangeAdapter, trade: Trade, extra: dict, exchange_qty: float,
     ) -> None:
-        """Mid-life attribution. A leg leaving the resting set is a TRIGGER to read
+        """[RETIRED from the live path — Phase-2C] Mid-life attribution. A leg leaving the resting set is a TRIGGER to read
         its terminal status — not, by itself, a fill (INV-2). Branch strictly on
         status: FILLED/PARTIALLY_FILLED -> book the slice; CANCELED/EXPIRED -> mark
         terminal, no PnL (its slice is attributed to the closer at close). Then run
@@ -1835,102 +2026,52 @@ class BotRunner:
         self, db: AsyncSession, adapter: ExchangeAdapter, manager: OrderManager,
         trade: Trade, extra: dict,
     ) -> None:
-        """CLOSE RECONCILE (position flat). Assign every slice leg a terminal
-        disposition from its STATUS (INV-2), attribute each canceled slice's
-        quantity to the actual closer, then verify the ledger balances (INV-1):
-        ``original_position_qty == Σ realized_qty over all dispositions``.
+        """CLOSE RECONCILE (position flat) — Phase-2C AUTHORITATIVE from userTrades.
+        The exchange's settled-fill ledger gives the exact net (Σ realizedPnl −
+        Σ commission) and exited quantity; the conservation law ``base == exit_qty``
+        (position is 0) is the close invariant. The closer is identified from order
+        STATUS only for a human-readable reason label — it no longer drives PnL."""
+        # Authoritative net + balance from userTrades (position now flat -> 0).
+        rec = await self._ladder_reconcile(db, adapter, trade, extra, 0.0, closing=True)
 
-        The closer (stop fill / runner fill / external close) absorbs the
-        remainder the tiers did not fill. Anything beyond a balanced close is a
-        phantom over-fill -> a close-time ladder_sync_anomaly."""
-        tier_orders = extra.get("tier_orders") or []
-        original_qty = float(extra.get("original_position_qty") or extra.get("original_quantity") or trade.quantity)
-
-        # 1) Resolve every still-open slice leg from its terminal status (INV-2).
-        for leg in tier_orders:
-            if (not leg.get("order_id")
-                    or is_terminal_status(classify_leg_status(leg.get("status")))
-                    or leg.get("recheck_exhausted")):   # rejected false-fill -> closer takes its slice
-                continue
-            status, fill_price, filled_qty = await self._read_leg_terminal(adapter, trade.symbol, leg)
-            if status in FILL_STATUSES and fill_price is not None and filled_qty:
-                pnl = self._ladder_book_fill(trade, extra, leg,
-                                             fill_price=fill_price, filled_qty=filled_qty, status=status)
-                if pnl is not None:
-                    await self._risk_event(
-                        db, "info", "ladder_tier_filled",
-                        f"{trade.symbol} TP{leg['index']} {status} at {fill_price} (at close)",
-                        {"trade_id": trade.id, "symbol": trade.symbol, "tier": leg["index"],
-                         "fill_price": fill_price, "quantity": filled_qty, "status": status,
-                         "pnl": round(pnl, 6)},
-                    )
-            else:
-                # Not a verified fill (canceled/expired/unverified-no-actual) -> closer takes slice.
-                leg["status"] = status if status in CANCEL_STATUSES else "canceled"
-                leg["filled"] = False
-
-        # 2) Resolve the runner + identify the closer from STATUS.
+        # Label the closer from exchange order status (display only).
         stop_id = extra.get("stop_order_id")
         runner_id = extra.get("runner_order_id")
-        runner_fill, runner_status = await self._read_runner_terminal(adapter, trade.symbol, runner_id)
-        if runner_status in FILL_STATUSES:
-            extra["runner_status"] = runner_status
-            extra["runner_filled_qty"] = float(extra.get("runner_quantity") or 0.0)
-            r_pnl = self._ladder_book_fill(
-                trade, extra,
-                {"order_id": runner_id, "index": "runner", "price": runner_fill,
-                 "quantity": extra.get("runner_quantity") or 0.0},
-                fill_price=runner_fill, filled_qty=float(extra.get("runner_quantity") or 0.0),
-                status=runner_status,
-            )
-            if r_pnl is not None:
-                trade.extra = extra  # keep runner accounting visible
-
-        # 3) Attribute the closer for the un-filled remainder (INV-1).
-        slice_filled = self._ladder_accounted_filled(extra)
-        closer_qty = round(original_qty - slice_filled, 10)
-        closer_price, close_reason = await self._attribute_exchange_close(adapter, trade.symbol, stop_id, runner_id)
+        _, close_reason = await self._attribute_exchange_close(adapter, trade.symbol, stop_id, runner_id)
         if close_reason == "take_profit_exchange":
             close_reason = "trailing_runner_exchange"
-        if closer_price <= 0:
-            try:
-                closer_price = (await adapter.fetch_order_book(trade.symbol, limit=20)).mid_price
-            except Exception:
-                closer_price = trade.entry_price
         if not close_reason:
-            close_reason = "external_close" if closer_qty > 1e-9 else "ladder_resting_close"
+            close_reason = "external_close"
 
-        # 4) Cancel leftovers, finalize the closer disposition, verify the ledger.
-        unfilled_tier_ids = [t.get("order_id") for t in tier_orders
-                             if t.get("order_id") and not t.get("filled")]
-        issues = await manager.cancel_orders(trade.symbol, [stop_id, runner_id, *unfilled_tier_ids])
+        # Cancel any leftover protective / tier / runner orders.
+        leftover_ids = [t.get("order_id") for t in (extra.get("tier_orders") or []) if t.get("order_id")]
+        issues = await manager.cancel_orders(trade.symbol, [stop_id, runner_id, *leftover_ids])
         if issues:
             logger.info("ladder_close_cancel_issues", symbol=trade.symbol, issues=issues)
 
         extra["ladder_active"] = False
-        trade.quantity = max(0.0, closer_qty)  # closer books exactly the un-filled remainder
+        trade.quantity = 0.0
         trade.extra = extra
-        await self._finalize_trade_close(db, trade, closer_price, close_reason)
 
-        # INV-1 ledger balance: dispositions must reconstruct the original position.
-        dispositions = round(slice_filled + max(0.0, closer_qty), 10)
-        balanced = abs(dispositions - original_qty) <= max(1e-8, original_qty * 1e-6) and closer_qty >= -max(1e-8, original_qty * 1e-6)
-        if not balanced:
-            # TASK 1 post-close INV-1 assertion: Σ(booked tier qty) + closer must
-            # reconstruct the original within tol; carry the explicit residual.
-            await self._risk_event(
-                db, "warning", "ladder_sync_anomaly",
-                f"{trade.symbol} close ledger imbalance: dispositions={dispositions} original={original_qty}",
-                {"trade_id": trade.id, "symbol": trade.symbol,
-                 "original_position_qty": original_qty, "slice_filled_qty": round(slice_filled, 10),
-                 "closer_qty": closer_qty, "dispositions_total": dispositions,
-                 "unexplained_residual_qty": round(dispositions - original_qty, 10),
-                 "assertion": "inv1_close_ledger",
-                 "close_reason": close_reason, "timestamp": utc_now().isoformat()},
+        if rec is not None:
+            # realized_pnl already set authoritatively by reconcile — finalize
+            # WITHOUT re-pricing a closer slice.
+            await self._finalize_trade_close(db, trade, trade.entry_price, close_reason, authoritative=True)
+            base = float(rec.get("base_qty") or 0.0)
+            exit_qty = float(rec.get("exit_qty") or 0.0)
+            balanced = abs(base - exit_qty) <= max(1e-8, base * self.settings.ladder_qty_gate_tol_pct)
+            await self._ladder_record_closed(
+                db, trade, close_reason, balanced=balanced,
+                original_qty=base, slice_filled=exit_qty, closer_qty=round(base - exit_qty, 10),
             )
-        await self._ladder_record_closed(db, trade, close_reason, balanced=balanced,
-                                         original_qty=original_qty, slice_filled=slice_filled,
-                                         closer_qty=closer_qty)
+        else:
+            # userTrades unavailable -> degrade to a mark-priced closer (legacy).
+            try:
+                closer_price = (await adapter.fetch_order_book(trade.symbol, limit=20)).mid_price
+            except Exception:
+                closer_price = trade.entry_price
+            await self._finalize_trade_close(db, trade, closer_price, close_reason)
+            await self._ladder_record_closed(db, trade, close_reason)
 
     async def _read_runner_terminal(
         self, adapter: ExchangeAdapter, symbol: str, runner_id: str | None,
@@ -2050,10 +2191,15 @@ class BotRunner:
             trade.symbol, [extra.get("stop_order_id"), extra.get("runner_order_id"), *tier_ids],
         )
         await self._send_reduce_only(adapter, trade, float(position.quantity))
-        trade.quantity = float(position.quantity)
         extra["ladder_active"] = False
+        trade.quantity = 0.0
         trade.extra = extra
-        await self._finalize_trade_close(db, trade, mark, "time_exit_full")
+        # Authoritative net from userTrades (the market close shows up as a reduce
+        # fill; the close-retry tolerates settle lag).
+        rec = await self._ladder_reconcile(db, adapter, trade, extra, 0.0, closing=True)
+        await self._finalize_trade_close(
+            db, trade, mark, "time_exit_full", authoritative=(rec is not None),
+        )
         await self._risk_event(
             db, "info", "ladder_time_full",
             f"{trade.symbol} 45-min full time exit",
@@ -2333,8 +2479,12 @@ class BotRunner:
         reason: str,
         *,
         send_alert: bool = True,
+        authoritative: bool = False,
     ) -> None:
-        trade.realized_pnl += self._exit_pnl(trade, price, trade.quantity)
+        # Phase-2C: when realized_pnl was already set authoritatively from userTrades
+        # (ladder close paths), do NOT re-price a closer slice on top of it.
+        if not authoritative:
+            trade.realized_pnl += self._exit_pnl(trade, price, trade.quantity)
         trade.unrealized_pnl = 0.0
         trade.status = "closed"
         trade.closed_at = utc_now()

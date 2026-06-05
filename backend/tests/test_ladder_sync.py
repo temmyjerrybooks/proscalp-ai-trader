@@ -23,10 +23,13 @@ from app.strategies.base_strategy import StrategyContext, StrategySignal
 class FakeExchange(ExchangeAdapter):
     name = "fake"
 
-    def __init__(self, *, positions=None, open_order_ids=None, order_fills=None):
+    def __init__(self, *, positions=None, open_order_ids=None, order_fills=None, user_trades=None):
         self._positions = positions or []
         self._open_order_ids = set(open_order_ids) if open_order_ids is not None else set()
         self._order_fills = order_fills or {}  # order_id -> average_price
+        # Phase-2C: authoritative fill ledger. None -> source unavailable (the
+        # reconcile degrades, mirroring an adapter that can't report userTrades).
+        self._user_trades = user_trades
         self.placed = []
         self.cancelled = []
         self._n = 0
@@ -57,6 +60,14 @@ class FakeExchange(ExchangeAdapter):
         return OrderResult(order_id, symbol, "filled" if avg else "new", "sell",
                            "take_profit_market", 0.2,
                            filled_quantity=(0.2 if avg else 0.0), average_price=avg or None)
+
+    async def fetch_user_trades(self, symbol, start_ms=None, limit=200):
+        # Phase-2C authoritative source. Unconfigured -> NotImplementedError so the
+        # reconcile returns None and the legacy/degraded path runs (keeps tests that
+        # don't model fills unaffected).
+        if self._user_trades is None:
+            raise NotImplementedError("user_trades not configured")
+        return [dict(r) for r in self._user_trades]
 
     # Ladder lifecycle runs on algo endpoints; delegate to the regular fakes.
     async def fetch_open_algo_orders(self, symbol=None):
@@ -121,6 +132,14 @@ def _ladder_trade(*, qty=0.6, tiers_filled_ids=(), opened_minutes_ago=1.0) -> Tr
     )
 
 
+def _ut(side, price, qty, realized=0.0, *, comm=0.0, oid="o", t=0):
+    """One userTrades fill row (Binance USDⓈ-M shape). For a LONG: entry=BUY,
+    exits=SELL. realized==0 marks the opening fill."""
+    return {"side": side, "price": str(price), "qty": str(qty),
+            "realizedPnl": str(realized), "commission": str(comm),
+            "commissionAsset": "USDT", "orderId": oid, "time": t}
+
+
 def _event_types(runner) -> list[str]:
     return [c.args[2] for c in runner._risk_event.await_args_list]
 
@@ -136,82 +155,54 @@ def _db():
 @pytest.mark.asyncio
 async def test_two_tiers_filled_books_pnl_and_advances_stop():
     runner = _runner()
-    trade = _ladder_trade(qty=0.6)  # 0.4 worth of tiers filled
-    # tp1/tp2 gone from the book (filled); tp3/tp4/runner/stop still resting.
+    trade = _ladder_trade(qty=0.6)  # 0.4 worth of tiers exited
+    # AUTHORITATIVE: userTrades shows entry 1.0 + two SELL exit fills (0.2 each).
     adapter = FakeExchange(
         positions=[Position("BTCUSDT", "long", 0.6, 1000.0, mark_price=1011.0)],
         open_order_ids={"tp3", "tp4", "run1", "sl1"},
-        order_fills={"tp1": 1003.0, "tp2": 1006.0},
+        user_trades=[
+            _ut("BUY", 1000.0, 1.0, 0.0, oid="entry"),
+            _ut("SELL", 1003.0, 0.2, 0.6, oid="x1"),
+            _ut("SELL", 1006.0, 0.2, 1.2, oid="x2"),
+        ],
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
 
-    assert trade.extra["tiers_filled"] == 2
-    assert trade.extra["tier_orders"][0]["filled"] is True
-    assert trade.extra["tier_orders"][1]["filled"] is True
-    assert trade.realized_pnl > 0  # two winning tiers booked
+    assert trade.extra["tiers_filled"] == 2          # 0.4 exited / 0.2 per tier
+    assert trade.realized_pnl == pytest.approx(1.8)  # Σ realizedPnl − Σ commission(0)
     # BE+ armed (mark 1011 >= entry + 0.5*ATR=1005) and stop ratcheted to +0.5% (1005).
     assert trade.extra["be_plus_armed"] is True
     assert trade.stop_loss == 1005.0
     et = _event_types(runner)
-    assert "ladder_tier_filled" in et
+    assert "ladder_tier_filled" in et                # per-fill audit from userTrades
     assert "ladder_be_plus_armed" in et
     assert "ladder_stop_advanced" in et
-    # exchange qty (0.6) matches the filled-tier accounting (1.0 - 0.4) -> no anomaly
+    # conservation: base 1.0 == exit 0.4 + position 0.6 -> no anomaly
     assert "ladder_sync_anomaly" not in et
 
 
 @pytest.mark.asyncio
-async def test_AC8_qtygate_rejects_uncorroborated_fill_and_escalates():
-    """TASK 1 / AC-8 — RED-FOR-THE-RIGHT-REASON. tp1 reports FILLED but the
-    position never sheds the qty. The qty-drop GATE must REJECT it — the OLD code
-    booked from status and only flagged a sync anomaly *after the fact*. It is NOT
-    booked; after N=ladder_falsefill_recheck_budget re-checks it escalates to a
-    typed ladder_false_fill_rejected carrying the residual. Crucially NO
-    ladder_tier_filled and NO ladder_sync_anomaly (nothing booked -> no
-    observational residual): the failure is on the qty-gate, not the old path."""
+async def test_status_claims_fill_but_usertrades_empty_no_phantom_book():
+    """Phase-2C: the booking path NEVER books from algo status. If a tier's status
+    looked 'filled' but userTrades shows NO reducing fill (and the position never
+    dropped), nothing is booked, realized_pnl stays at the entry-fee baseline, and
+    the conservation law holds (base == position) -> NO phantom fill, NO anomaly.
+    This is the structural cure for the over-/under-book oscillation."""
     runner = _runner()
     trade = _ladder_trade(qty=1.0)
     trade.extra["original_position_qty"] = 1.0
-    # tp1 reports FILLED 0.2 every poll, but the position STAYS at 1.0 (never drops).
-    # mark == entry so the marching stop does not ratchet (the static fixture can't
-    # follow a place-new/cancel-old stop id); keeps the protection-present check True
-    # so the patient re-check runs to the full budget.
     adapter = FakeExchange(
         positions=[Position("BTCUSDT", "long", 1.0, 1000.0, mark_price=1000.0)],
-        open_order_ids={"tp2", "tp3", "tp4", "run1", "sl1"},
-        order_fills={"tp1": 1003.0},
-    )
-    budget = runner.settings.ladder_falsefill_recheck_budget
-    for _ in range(budget):
-        await runner._sync_ladder_trades(_db(), adapter, [trade])
-
-    et = _event_types(runner)
-    assert trade.extra["tier_orders"][0]["filled"] is False   # GATE rejected -> never booked
-    assert trade.realized_pnl == 0.0
-    assert "ladder_tier_filled" not in et
-    assert "ladder_sync_anomaly" not in et                    # nothing booked -> no residual
-    assert "ladder_false_fill_rejected" in et                 # escalated on budget exhaustion
-    payload = next(c.args[4] for c in runner._risk_event.await_args_list
-                   if c.args[2] == "ladder_false_fill_rejected")
-    assert payload["reason"] == "qty_drop_not_corroborated"
-    assert payload["unexplained_residual_qty"] == pytest.approx(-0.2)
-    assert payload["recheck_count"] == budget
-    assert payload["protection_lapsed"] is False              # marching stop ("sl1") present
-    assert "timestamp" in payload
-
-
-@pytest.mark.asyncio
-async def test_slippage_anomaly_logged_when_fill_far_from_trigger():
-    runner = _runner()
-    trade = _ladder_trade(qty=0.8)
-    # tp1 filled far below its 1003 trigger (50+ bps) -> anomaly.
-    adapter = FakeExchange(
-        positions=[Position("BTCUSDT", "long", 0.8, 1000.0, mark_price=1004.0)],
-        open_order_ids={"tp2", "tp3", "tp4", "run1", "sl1"},
-        order_fills={"tp1": 995.0},
+        open_order_ids={"tp1", "tp2", "tp3", "tp4", "run1", "sl1"},
+        user_trades=[_ut("BUY", 1000.0, 1.0, 0.0, oid="entry")],  # entry only, no exits
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
-    assert "ladder_slippage_anomaly" in _event_types(runner)
+
+    et = _event_types(runner)
+    assert trade.realized_pnl == pytest.approx(0.0)            # only the (zero-fee) entry
+    assert all(not t.get("filled") for t in trade.extra["tier_orders"])
+    assert "ladder_tier_filled" not in et                      # never booked from status
+    assert "ladder_sync_anomaly" not in et                     # base 1.0 == exit 0 + pos 1.0
 
 
 @pytest.mark.asyncio
@@ -221,10 +212,16 @@ async def test_runner_activation_after_all_tiers_filled():
     adapter = FakeExchange(
         positions=[Position("BTCUSDT", "long", 0.2, 1000.0, mark_price=1017.0)],
         open_order_ids={"run1", "sl1"},  # all 4 TP tiers gone
-        order_fills={"tp1": 1003.0, "tp2": 1006.0, "tp3": 1010.0, "tp4": 1016.0},
+        user_trades=[
+            _ut("BUY", 1000.0, 1.0, 0.0, oid="entry"),
+            _ut("SELL", 1003.0, 0.2, 0.6, oid="x1"),
+            _ut("SELL", 1006.0, 0.2, 1.2, oid="x2"),
+            _ut("SELL", 1010.0, 0.2, 2.0, oid="x3"),
+            _ut("SELL", 1016.0, 0.2, 3.2, oid="x4"),
+        ],
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
-    assert trade.extra["tiers_filled"] == 4
+    assert trade.extra["tiers_filled"] == 4          # 0.8 exited / 0.2
     assert trade.extra["runner_active"] is True
     assert "ladder_runner_active" in _event_types(runner)
 
@@ -233,14 +230,19 @@ async def test_runner_activation_after_all_tiers_filled():
 async def test_stop_not_advanced_when_rung_above_mark():
     runner = _runner()
     trade = _ladder_trade(qty=0.4)
-    # 3 tiers filled -> rung +1.0% (1010) but mark only 1008 -> deferred, no move.
+    # 3 tiers exited -> rung +1.0% (1010) but mark only 1008 -> highest feasible below.
     adapter = FakeExchange(
         positions=[Position("BTCUSDT", "long", 0.4, 1000.0, mark_price=1008.0)],
         open_order_ids={"tp4", "run1", "sl1"},
-        order_fills={"tp1": 1003.0, "tp2": 1006.0, "tp3": 1010.0},
+        user_trades=[
+            _ut("BUY", 1000.0, 1.0, 0.0, oid="entry"),
+            _ut("SELL", 1003.0, 0.2, 0.6, oid="x1"),
+            _ut("SELL", 1006.0, 0.2, 1.2, oid="x2"),
+            _ut("SELL", 1010.0, 0.2, 2.0, oid="x3"),
+        ],
     )
     await runner._sync_ladder_trades(_db(), adapter, [trade])
-    # stop should have advanced to the highest rung still below mark (+0.5% = 1005),
+    # stop advances to the highest rung still below mark (+0.5% = 1005),
     # not to +1.0% which would sit above the 1008 mark.
     assert trade.stop_loss == 1005.0
 
@@ -251,18 +253,27 @@ async def test_stop_not_advanced_when_rung_above_mark():
 async def test_position_gone_finalizes_and_emits_150_count_event():
     runner = _runner()
     trade = _ladder_trade(qty=0.2)
-    # No position on the exchange -> fully closed. runner order reported filled.
-    adapter = FakeExchange(positions=[], order_fills={"run1": 1020.0})
+    # No position on the exchange -> fully closed. AUTHORITATIVE: userTrades carries
+    # the full ledger (entry 1.0; 4 tiers + runner exit 1.0); net is exact + balanced.
+    adapter = FakeExchange(positions=[], user_trades=[
+        _ut("BUY", 1000.0, 1.0, 0.0, oid="entry"),
+        _ut("SELL", 1003.0, 0.2, 0.6, oid="x1"),
+        _ut("SELL", 1006.0, 0.2, 1.2, oid="x2"),
+        _ut("SELL", 1010.0, 0.2, 2.0, oid="x3"),
+        _ut("SELL", 1016.0, 0.2, 3.2, oid="x4"),
+        _ut("SELL", 1020.0, 0.2, 4.0, oid="run"),
+    ])
     await runner._sync_ladder_trades(_db(), adapter, [trade])
 
     assert trade.status == "closed"
     assert trade.extra["ladder_active"] is False
+    assert trade.realized_pnl == pytest.approx(11.0)  # Σ realizedPnl, zero commission
     et = _event_types(runner)
     assert "ladder_trade_closed" in et
-    # the 150-count flag is set on the closing audit event
     closed_payload = next(c.args[4] for c in runner._risk_event.await_args_list
                           if c.args[2] == "ladder_trade_closed")
     assert closed_payload["counts_toward_150"] is True
+    assert closed_payload["ledger_balanced"] is True   # base 1.0 == exit 1.0
     # leftover stop/runner cancelled defensively
     assert ("BTCUSDT", "sl1") in adapter.cancelled
 
