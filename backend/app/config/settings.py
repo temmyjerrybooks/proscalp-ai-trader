@@ -165,6 +165,20 @@ class Settings(BaseSettings):
     autonomous_trading_enabled: bool = True
     bot_loop_interval_seconds: int = 10
     bot_cycle_symbol_limit: int = 25
+    # Pluggable signal-engine selector. "classic" = the original 7-setup scoring
+    # pipeline and is a byte-for-byte no-op vs the pre-framework behavior, so the
+    # committed default is inert. Switchable at runtime via /api/bot/signal-engine
+    # (and the nav dropdown) for live testnet A/B; persists across restarts only if
+    # set here / via SIGNAL_ENGINE_MODE env.
+    signal_engine_mode: str = "classic"
+    # Stat-Arb engine (signal_engine_mode="stat_arb") — single-leg BTC-relative
+    # mean reversion. Tunable without code change; only active when that mode is on.
+    stat_arb_reference_symbol: str = "BTCUSDT"
+    stat_arb_timeframe: str = "5m"
+    stat_arb_lookback: int = 60          # bars in the z-score window
+    stat_arb_entry_z: float = 2.0        # |z| threshold to fade the spread
+    stat_arb_require_turn: bool = True   # require the spread to have begun reverting
+    stat_arb_stop_atr_mult: float = 1.2  # stop distance = mult x ATR
     bot_max_orders_per_cycle: int = 2  # SECOND FLIP 2026-05-31: up from 1 (capture multi-signal cycles)
     bot_min_seconds_between_orders: int = 10  # SECOND FLIP 2026-05-31: down from 30 (coupled with the cap bump; ~cycle length)
     signal_followup_enabled: bool = True

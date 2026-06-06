@@ -1,8 +1,10 @@
 import { Pause, Play, Siren } from "lucide-react";
-import { apiPost, money, signedMoney, timeLabel } from "../api";
+import { apiJsonPost, apiPost, money, signedMoney, timeLabel } from "../api";
 import { useApi } from "../hooks";
 import type { ActivityRow, DashboardData } from "../types";
 import { MetricCard, Panel, ProgressBar, StatusBadge } from "../components/UI";
+
+type SignalEngineList = { active: string; engines: { name: string; description: string }[] };
 
 const fallback: DashboardData = {
   account_equity: 10000,
@@ -23,6 +25,14 @@ const fallback: DashboardData = {
 export function Dashboard() {
   const { data, refresh, lastUpdated } = useApi<DashboardData>("/api/dashboard", fallback, { pollIntervalMs: 5000 });
   const { data: activity } = useApi<ActivityRow[]>("/api/activity", [], { pollIntervalMs: 3000 });
+  const engines = useApi<SignalEngineList>(
+    "/api/bot/signal-engines",
+    { active: "classic", engines: [] },
+    { pollIntervalMs: 10000 }
+  );
+  const activeEngine = String(engines.data.active ?? data.bot.signal_engine ?? "classic");
+  const activeEngineDescription =
+    engines.data.engines.find((engine) => engine.name === activeEngine)?.description ?? "";
   const signalChecks = botNumber(data.bot, "last_signal_count");
   const rejectionCount = botNumber(data.bot, "last_rejection_count");
   const orderCount = botNumber(data.bot, "last_order_count");
@@ -33,6 +43,11 @@ export function Dashboard() {
   async function control(path: string) {
     await apiPost(path);
     await refresh();
+  }
+
+  async function selectEngine(mode: string) {
+    await apiJsonPost("/api/bot/signal-engine", { mode });
+    await Promise.all([engines.refresh(), refresh()]);
   }
 
   return (
@@ -62,6 +77,23 @@ export function Dashboard() {
               </button>
             </div>
           </div>
+          {engines.data.engines.length > 0 && (
+            <div className="mb-4 flex flex-wrap items-center gap-3 border-t border-line pt-3">
+              <span className="text-xs uppercase tracking-wide text-slate-400">Signal Engine</span>
+              <select
+                value={activeEngine}
+                onChange={(event) => void selectEngine(event.target.value)}
+                className="h-9 rounded border border-line bg-panel2 px-3 text-sm"
+              >
+                {engines.data.engines.map((engine) => (
+                  <option key={engine.name} value={engine.name}>{engine.name}</option>
+                ))}
+              </select>
+              <span className="min-w-0 flex-1 truncate text-xs text-slate-500" title={activeEngineDescription}>
+                {activeEngineDescription}
+              </span>
+            </div>
+          )}
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
               <div className="mb-2 flex justify-between text-xs text-slate-400">
@@ -94,6 +126,7 @@ export function Dashboard() {
           </div>
           <div className="mt-3 grid gap-2 border-t border-line pt-3 text-sm text-slate-300 sm:grid-cols-2">
             <div className="flex justify-between gap-3"><span>Scan Scope</span><span>{formatScope(cycleSymbolLimit, watchlistCount)}</span></div>
+            <div className="flex justify-between gap-3"><span>Engine</span><StatusBadge value={activeEngine} /></div>
             <div className="flex justify-between gap-3"><span>Strategies</span><span>{strategyCount || "-"}</span></div>
             <div className="flex justify-between gap-3"><span>Signal Checks</span><span>{signalChecks}</span></div>
             <div className="flex justify-between gap-3"><span>Rejected</span><span>{rejectionCount}</span></div>

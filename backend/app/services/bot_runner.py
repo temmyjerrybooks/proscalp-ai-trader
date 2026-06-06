@@ -58,6 +58,7 @@ from app.services.accounting import (
     trade_counts_for_loss_streak,
 )
 from app.sessions.session_manager import SessionManager, SessionState
+from app.signal_engines import EngineContext, ScoredSignal, get_engine
 from app.strategies import default_strategies
 from app.strategies.base_strategy import Direction, StrategyContext, StrategySignal
 from app.universe.top50_scanner import CoinCandidate, Top50Scanner
@@ -95,6 +96,7 @@ class BotRuntimeStatus:
     last_order_count: int = 0
     cycle_symbol_limit: int = 0
     strategy_count: int = 0
+    signal_engine: str = "classic"
     current_session: str = "closed"
     current_regime: str = "unclear"
     open_trade_count: int = 0
@@ -104,15 +106,6 @@ class BotRuntimeStatus:
     loss_cooldown_since: datetime | None = None
     last_error: str | None = None
     messages: list[str] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class ScoredSignal:
-    signal: StrategySignal
-    score: SetupScoreResult
-    signal_id: str
-    candidate: CoinCandidate
-    context: StrategyContext
 
 
 class BotRunner:
@@ -138,6 +131,12 @@ class BotRunner:
         self.strategies = default_strategies()
         self.status.cycle_symbol_limit = self.settings.bot_cycle_symbol_limit
         self.status.strategy_count = len(self.strategies)
+        # Pluggable signal-engine layer: the runner generates entry signals via the
+        # selected engine; sizing/execution/exit-ladder are shared and engine-agnostic.
+        # Mode is mutable at runtime (see set_signal_engine) for live testnet A/B.
+        self._engine_mode = (self.settings.signal_engine_mode or "classic").strip().lower()
+        self.engine = get_engine(self._engine_mode, self.settings)
+        self.status.signal_engine = self.engine.name
         self._task: asyncio.Task[None] | None = None
         self._last_order_at: datetime | None = None
         self._consecutive_losses = 0
@@ -161,6 +160,25 @@ class BotRunner:
     def current_signal_ids(self) -> list[str]:
         """Return the exact signal IDs from the last committed scan batch."""
         return list(self._last_signal_ids)
+
+    def signal_engine_mode(self) -> str:
+        """The active signal-engine mode (the stable name of the current engine)."""
+        return self.engine.name
+
+    def set_signal_engine(self, mode: str) -> str:
+        """Switch the active signal engine at runtime (in-memory on the singleton).
+
+        Takes effect on the *next* cycle's signal generation; positions already
+        open finish on whatever engine opened them (each trade carries its own
+        ``extra['signal_engine']``). Unknown modes fall back to Classic (logged by
+        the registry). Returns the resolved engine name actually selected.
+        """
+        self.engine = get_engine(mode, self.settings)
+        self._engine_mode = self.engine.name
+        self.status.signal_engine = self.engine.name
+        self._remember(f"Signal engine set to '{self.engine.name}'")
+        logger.info("signal_engine_switched", mode=self.engine.name, requested=mode)
+        return self.engine.name
 
     async def start(self) -> BotRuntimeStatus:
         if not self.settings.autonomous_trading_enabled:
@@ -619,7 +637,7 @@ class BotRunner:
             )
             account_equity = daily_snapshot.account_equity
             btc_direction, eth_direction = await self._leader_directions(adapter)
-            scored_signals = await self._scan_for_signals(
+            engine_ctx = EngineContext(
                 db=db,
                 adapter=adapter,
                 candidates=candidates,
@@ -628,6 +646,7 @@ class BotRunner:
                 btc_direction=btc_direction,
                 eth_direction=eth_direction,
             )
+            scored_signals = await self.engine.generate(self, engine_ctx)
             if not scored_signals:
                 result = await self._cycle_wait(db, "No setup passed strategy scoring")
                 self._publish_pending_signal_batch()
@@ -1323,6 +1342,7 @@ class BotRunner:
                 status=trade_status,
                 extra={
                     "signal_id": scored.signal_id,
+                    "signal_engine": self.engine.name,
                     "setup_score": scored.score.total,
                     "grade": setup_assessment.grade,
                     "normal_grade": scored.score.grade,
