@@ -888,6 +888,7 @@ class BotRunner:
             setup_score=scored.score.total,
             setup_grade=setup_assessment.grade,
             btc_eth_confirmed=btc_eth_confirmed,
+            leader_confirmation_required=self.engine.requires_leader_confirmation,
             risk_reward=signal.risk_reward_ratio,
             position_size_valid=position_size.valid,
             order_size_valid=order_size_valid,

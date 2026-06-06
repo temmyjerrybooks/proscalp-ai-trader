@@ -35,6 +35,11 @@ class SignalEngine(ABC):
 
     name: str = "base"
     description: str = ""
+    # Trend setups need BTC/ETH leader confirmation; mean-reversion engines that
+    # deliberately FADE the leaders set this False so the shared execution path
+    # doesn't reject their (intentionally counter-leader) entries. Only relaxes the
+    # leader *requirement* — the real leader state still flows to correlated-exposure.
+    requires_leader_confirmation: bool = True
 
     @abstractmethod
     async def generate(self, runner: "BotRunner", ctx: EngineContext) -> list[ScoredSignal]:

@@ -47,6 +47,9 @@ _BUILDER = _StatArbSignalBuilder()
 class StatArbEngine(SignalEngine):
     name = "stat_arb"
     description = "Single-leg BTC-relative mean reversion: fade alts stretched far from their ln(alt/BTC) mean (z-score), entering back toward the mean."
+    # Mean reversion fades the leaders, so BTC/ETH confirmation is N/A — exempt it
+    # (otherwise the shared trend-oriented gate rejects ~all entries).
+    requires_leader_confirmation = False
 
     async def generate(self, runner: "BotRunner", ctx: EngineContext) -> list[ScoredSignal]:
         settings = runner.settings

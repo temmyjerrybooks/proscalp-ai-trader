@@ -239,3 +239,44 @@ def test_unclear_regime_can_be_explicitly_allowed():
     )
 
     assert decision.allowed is True
+
+
+def _allowed_request(**overrides) -> TradePermissionRequest:
+    base = dict(
+        bot_enabled=True,
+        exchange_connected=True,
+        live_requested=False,
+        daily_pnl_pct=0,
+        consecutive_losses=0,
+        open_trades=0,
+        market_regime="good",
+        session_tradable=True,
+        coin_in_watchlist=True,
+        liquid_enough=True,
+        spread_bps=1,
+        expected_net_profit_pct=0.2,
+        setup_score=85,
+        setup_grade="A",
+        btc_eth_confirmed=True,
+        risk_reward=1.5,
+        position_size_valid=True,
+        order_size_valid=True,
+    )
+    base.update(overrides)
+    return TradePermissionRequest(**base)
+
+
+def test_leader_confirmation_required_by_default_blocks_unconfirmed():
+    # Classic behavior unchanged: default leader_confirmation_required=True.
+    decision = RiskEngine().evaluate_trade_permission(_allowed_request(btc_eth_confirmed=False))
+    assert "BTC/ETH confirmation is invalid" in decision.reasons
+
+
+def test_leader_confirmation_exemption_allows_unconfirmed_entry():
+    # Mean-reversion engines set leader_confirmation_required=False -> the gate is
+    # relaxed (the real btc_eth_confirmed value still flows to exposure separately).
+    decision = RiskEngine().evaluate_trade_permission(
+        _allowed_request(btc_eth_confirmed=False, leader_confirmation_required=False)
+    )
+    assert "BTC/ETH confirmation is invalid" not in decision.reasons
+    assert decision.allowed is True

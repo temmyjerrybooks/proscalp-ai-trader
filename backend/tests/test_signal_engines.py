@@ -239,3 +239,11 @@ async def test_persist_execution_stamps_active_engine(fake_engine):
     assert isinstance(trade, Trade)
     assert trade.extra["signal_engine"] == "fakearb"
     assert trade in db.added
+
+
+def test_engine_leader_confirmation_flags():
+    """Trend engines require leader confirmation; mean-reversion (stat_arb) is exempt."""
+    from app.signal_engines import StatArbEngine
+
+    assert ClassicEngine().requires_leader_confirmation is True
+    assert StatArbEngine().requires_leader_confirmation is False

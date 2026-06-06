@@ -65,6 +65,7 @@ class TradePermissionRequest:
     order_size_valid: bool
     setup_score_threshold: int | None = None
     recent_consecutive_losses: int | None = None
+    leader_confirmation_required: bool = True
 
 
 @dataclass(slots=True)
@@ -325,7 +326,7 @@ class RiskEngine:
             (request.expected_net_profit_pct > 0, "expected move does not beat fees and slippage"),
             (request.setup_score >= setup_threshold, f"setup score is below required threshold {setup_threshold}"),
             (request.setup_grade != "NO_TRADE", "setup grade is not tradable"),
-            (request.btc_eth_confirmed, "BTC/ETH confirmation is invalid"),
+            (request.btc_eth_confirmed or not request.leader_confirmation_required, "BTC/ETH confirmation is invalid"),
             (request.risk_reward >= self.settings.min_risk_reward, "risk-reward is below minimum"),
             (request.position_size_valid, "position size is invalid"),
             (request.order_size_valid, "order size is below exchange minimum"),
