@@ -913,7 +913,8 @@ class BotRunner:
                 return False
 
         manager = OrderManager(adapter, risk_engine=self.risk_engine, paper=self.paper, settings=self.settings)
-        report = await manager.execute_signal(signal, permission, position_size.quantity)
+        use_maker = bool(self.settings.maker_entry_enabled and getattr(self.engine, "prefer_maker_entry", False))
+        report = await manager.execute_signal(signal, permission, position_size.quantity, maker=use_maker)
         trade = await self._persist_execution(
             db,
             scored,
@@ -1115,6 +1116,30 @@ class BotRunner:
                 if snapshot and snapshot.atr > 0:
                     return float(snapshot.atr)
         return abs(scored.signal.entry_price - scored.signal.stop_loss)
+
+    async def _protect_filled_pending(self, db: AsyncSession, trade: Trade) -> None:
+        """Attach Branch-1 protective stop+TP to a maker entry that FILLED while
+        resting — it had no exits at entry time (the entry-time attach only runs for
+        immediately-filled orders). Closes the unprotected-pending gap. Reconstructs
+        the signal from the persisted trade row and reuses the standard attach path."""
+        tp = trade.take_profit if isinstance(trade.take_profit, dict) else {}
+        tp_levels = list(tp.get("levels", []) or [])
+        signal = StrategySignal(
+            setup_name=trade.setup_name or "maker entry",
+            symbol=trade.symbol,
+            direction=trade.side,  # type: ignore[arg-type]
+            entry_price=trade.entry_price,
+            stop_loss=trade.stop_loss,
+            take_profit_levels=tp_levels,
+            trailing_stop=0.0,
+            expected_move=0.0,
+            risk_reward_ratio=0.0,
+            confidence_score=0.0,
+            accepted=True,
+        )
+        adapter = create_exchange_adapter(self.settings)
+        manager = OrderManager(adapter, risk_engine=self.risk_engine, paper=self.paper, settings=self.settings)
+        await self._attach_branch1_protective(db, manager, signal, trade)
 
     async def _attach_branch1_protective(
         self, db: AsyncSession, manager: OrderManager, signal: StrategySignal, trade: Trade
@@ -2332,22 +2357,48 @@ class BotRunner:
         pending_symbols = {trade.symbol for trade in pending_trades}
         order_symbols = {order.symbol for order in open_orders}
 
+        recon_adapter = None  # lazy: only built if we must cancel a stale resting order
         for trade in pending_trades:
             position = next((item for item in positions if item.symbol == trade.symbol), None)
             if position:
                 trade.status = "open"
                 trade.entry_price = position.entry_price or trade.entry_price
                 trade.quantity = position.quantity
-                trade.extra = {
+                extra = {
                     **(trade.extra or {}),
                     "reconciled_from_exchange": True,
                     "remaining_quantity": position.quantity,
                 }
+                trade.extra = extra
                 open_symbols.add(trade.symbol)
+                # Close the unprotected-pending gap: a maker entry that filled while
+                # resting got no exits at entry time — attach Branch-1 protective now.
+                # Idempotent (skipped if already protected by ladder/resting).
+                if (
+                    self._use_exchange_resting_exits()
+                    and not extra.get("exchange_resting_active")
+                    and not extra.get("ladder_active")
+                ):
+                    await self._protect_filled_pending(db, trade)
             elif trade.symbol not in order_symbols:
                 trade.status = "canceled"
                 trade.closed_at = utc_now()
                 trade.extra = {**(trade.extra or {}), "close_reason": "order_not_open_on_exchange"}
+            else:
+                # Order still resting unfilled (e.g. a post-only maker entry) — cancel
+                # it once it has out-stayed its TTL so stale entries don't fill late.
+                opened = trade.opened_at or trade.created_at
+                age = (utc_now() - opened).total_seconds() if opened else 0.0
+                if age > self.settings.maker_entry_ttl_seconds:
+                    order_id = (trade.extra or {}).get("exchange_order_id")
+                    if order_id:
+                        if recon_adapter is None:
+                            recon_adapter = create_exchange_adapter(self.settings)
+                        with suppress(Exception):
+                            await recon_adapter.cancel_order(trade.symbol, str(order_id))
+                    trade.status = "canceled"
+                    trade.closed_at = utc_now()
+                    trade.extra = {**(trade.extra or {}), "close_reason": "maker_entry_ttl_expired"}
 
         for position in positions:
             if position.symbol in open_symbols or position.symbol in pending_symbols:

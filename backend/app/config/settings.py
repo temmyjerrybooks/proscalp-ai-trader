@@ -190,6 +190,14 @@ class Settings(BaseSettings):
     mr_ranging_filter_enabled: bool = False  # ER filter; off by default (more trades = more profit at maker fees)
     mr_er_n: int = 20
     mr_er_max: float = 0.35                # only trade when Efficiency Ratio <= this (when filter on)
+    # Post-only (maker) entries — the profitability lever. When ON (and the active
+    # engine sets prefer_maker_entry), entries REST as post-only GTX limit orders on
+    # the maker side instead of crossing the spread (taker). Cuts ~0.16%/trade in
+    # fees+slippage — the difference between net-negative and net-positive scalping.
+    # Gated default OFF. Requires exchange_resting_exits_enabled (filled makers get
+    # Branch-1 protective stop+TP on the next cycle). Unfilled rests are TTL-canceled.
+    maker_entry_enabled: bool = False
+    maker_entry_ttl_seconds: int = 90      # cancel a resting maker entry if unfilled this long
     bot_max_orders_per_cycle: int = 2  # SECOND FLIP 2026-05-31: up from 1 (capture multi-signal cycles)
     bot_min_seconds_between_orders: int = 10  # SECOND FLIP 2026-05-31: down from 30 (coupled with the cap bump; ~cycle length)
     signal_followup_enabled: bool = True

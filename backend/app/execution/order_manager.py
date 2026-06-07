@@ -118,6 +118,7 @@ class OrderManager:
         signal: StrategySignal,
         permission_request: TradePermissionRequest,
         quantity: float,
+        maker: bool = False,
     ) -> ExecutionReport:
         decision = self.risk_engine.evaluate_trade_permission(permission_request)
         if not decision.allowed:
@@ -129,6 +130,8 @@ class OrderManager:
             order_type = "limit"
         else:
             order_type = "market" if execution_score >= self.settings.market_order_min_score else "limit"
+        if maker:
+            order_type = "limit"  # post-only entries must rest as limit orders
         side = "buy" if signal.direction == "long" else "sell"
         client_order_id = f"proscalp-{uuid4().hex[:20]}"
 
@@ -147,7 +150,11 @@ class OrderManager:
         limit_price: float | None = None
         if order_type == "limit":
             try:
-                limit_price = await self._aggressive_limit_price(signal, side)
+                limit_price = (
+                    await self._maker_limit_price(signal, side)
+                    if maker
+                    else await self._aggressive_limit_price(signal, side)
+                )
             except ValueError as exc:
                 logger.info("trade_rejected", symbol=signal.symbol, setup=signal.setup_name, reasons=[str(exc)])
                 return ExecutionReport(False, self.settings.trading_mode.value, decision, reasons=[str(exc)])
@@ -159,7 +166,11 @@ class OrderManager:
             quantity=quantity,
             price=limit_price if order_type == "limit" else None,
             client_order_id=client_order_id,
-            time_in_force=self.settings.scalp_limit_time_in_force if order_type == "limit" else None,
+            time_in_force=(
+                ("GTX" if maker else self.settings.scalp_limit_time_in_force)
+                if order_type == "limit"
+                else None
+            ),
         )
         try:
             result = await self.adapter.place_order(request)
@@ -194,6 +205,22 @@ class OrderManager:
         if side == "buy":
             return book.best_ask * (1 + buffer)
         return book.best_bid * (1 - buffer)
+
+    async def _maker_limit_price(self, signal: StrategySignal, side: str) -> float:
+        """Post-only (maker) entry price: rest on the maker side of the book so the
+        order provides liquidity and earns the maker fee. Paired with TIF=GTX, Binance
+        rejects it outright if it would cross (i.e. it can never fill as taker). Guards
+        against a stale signal price drifting too far from the live book."""
+        book = await self.adapter.fetch_order_book(signal.symbol, limit=20)
+        if not self._book_is_usable(book):
+            raise ValueError("order book is not usable for maker entry")
+        reference = book.best_bid if side == "buy" else book.best_ask
+        drift_bps = abs(reference - signal.entry_price) / max(signal.entry_price, 1e-12) * 10_000
+        if drift_bps > self.settings.max_signal_price_drift_bps:
+            raise ValueError(
+                f"maker price drift is {drift_bps:.2f} bps; max is {self.settings.max_signal_price_drift_bps:.2f} bps"
+            )
+        return book.best_bid if side == "buy" else book.best_ask
 
     @staticmethod
     def _book_is_usable(book: OrderBook) -> bool:
