@@ -7,6 +7,7 @@ and the exit ladder are shared and engine-agnostic.
 
 from app.signal_engines.base import SignalEngine
 from app.signal_engines.classic import ClassicEngine
+from app.signal_engines.mean_reversion import MeanReversionEngine
 from app.signal_engines.stat_arb import StatArbEngine
 from app.signal_engines.registry import (
     available_engines,
@@ -20,6 +21,7 @@ __all__ = [
     "SignalEngine",
     "ClassicEngine",
     "StatArbEngine",
+    "MeanReversionEngine",
     "EngineContext",
     "ScoredSignal",
     "available_engines",

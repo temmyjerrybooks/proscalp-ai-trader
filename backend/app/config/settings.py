@@ -179,6 +179,17 @@ class Settings(BaseSettings):
     stat_arb_entry_z: float = 2.0        # |z| threshold to fade the spread
     stat_arb_require_turn: bool = True   # require the spread to have begun reverting
     stat_arb_stop_atr_mult: float = 1.2  # stop distance = mult x ATR
+    # Mean-reversion engine (signal_engine_mode="mean_reversion") — fade each coin's
+    # OWN over-extension (no BTC comparison). Backtest-derived defaults; net-positive
+    # at maker fees, so the profitability lever is post-only entries (separate flag).
+    mr_timeframe: str = "5m"
+    mr_lookback: int = 20                  # SMA window (the "mean")
+    mr_atr_period: int = 14
+    mr_entry_z: float = 2.0                # enter at >= this many ATR from the mean
+    mr_stop_atr: float = 1.0               # stop = mult x ATR beyond the extreme
+    mr_ranging_filter_enabled: bool = False  # ER filter; off by default (more trades = more profit at maker fees)
+    mr_er_n: int = 20
+    mr_er_max: float = 0.35                # only trade when Efficiency Ratio <= this (when filter on)
     bot_max_orders_per_cycle: int = 2  # SECOND FLIP 2026-05-31: up from 1 (capture multi-signal cycles)
     bot_min_seconds_between_orders: int = 10  # SECOND FLIP 2026-05-31: down from 30 (coupled with the cap bump; ~cycle length)
     signal_followup_enabled: bool = True

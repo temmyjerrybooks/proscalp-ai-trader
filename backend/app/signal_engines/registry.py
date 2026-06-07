@@ -13,6 +13,7 @@ import structlog
 
 from app.signal_engines.base import SignalEngine
 from app.signal_engines.classic import ClassicEngine
+from app.signal_engines.mean_reversion import MeanReversionEngine
 from app.signal_engines.stat_arb import StatArbEngine
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -26,6 +27,7 @@ DEFAULT_MODE = "classic"
 _REGISTRY: dict[str, Callable[[], SignalEngine]] = {
     "classic": ClassicEngine,
     "stat_arb": StatArbEngine,
+    "mean_reversion": MeanReversionEngine,
 }
 
 
