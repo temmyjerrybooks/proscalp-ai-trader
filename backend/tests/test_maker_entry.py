@@ -11,16 +11,34 @@ Covers the two things that matter:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from unittest.mock import AsyncMock
 
 from app.config.settings import Settings, TradingMode
 from app.database.models import Trade
 from app.exchanges.base import Balance, Candle, ExchangeAdapter, OrderBook, OrderRequest, OrderResult, Ticker
-from app.execution.order_manager import OrderManager
+from app.execution.order_manager import OrderManager, ProtectiveOrdersResult
 from app.risk.risk_engine import TradePermissionRequest
 from app.services.bot_runner import BotRunner
 from app.strategies.base_strategy import StrategySignal
+
+
+class _FakeDB:
+    def add(self, obj):
+        pass
+
+    async def flush(self):
+        pass
+
+
+class _CloseRecorder:
+    def __init__(self):
+        self.closed: list[str] = []
+
+    async def close_position(self, symbol: str):
+        self.closed.append(symbol)
+        return OrderResult("c", symbol, "filled", "sell", "market", 0)
 
 
 class RecordingExchange(ExchangeAdapter):
@@ -142,3 +160,48 @@ async def test_protect_filled_pending_reconstructs_signal_and_attaches():
     assert signal.symbol == "ETHUSDT"
     assert signal.stop_loss == 99.0
     assert signal.take_profit_levels == [101.0, 102.0, 103.0]
+
+
+# ------------------------------------------------------------------ close-on-attach-fail (safety)
+
+def _runner_for_attach():
+    runner = BotRunner(Settings(trading_mode=TradingMode.TESTNET))
+    runner._risk_event = AsyncMock()
+    runner._record_protective_attach_outcome = AsyncMock()
+    return runner
+
+
+async def test_naked_position_market_closed_when_stop_fails():
+    """No stop placed -> position would be naked -> market-close it immediately."""
+    runner = _runner_for_attach()
+    rec = _CloseRecorder()
+    manager = SimpleNamespace(adapter=rec, attach_protective_orders=AsyncMock(
+        return_value=ProtectiveOrdersResult(stop_order_id=None, take_profit_order_id=None,
+                                            elapsed_ms=5.0, success=False,
+                                            reasons=["stop_market placement failed: 400"])))
+    trade = Trade(symbol="BCHUSDT", side="long", entry_price=100.0, stop_loss=99.0,
+                  take_profit={"levels": [101.0]}, status="open", quantity=2.0, setup_name="mr")
+
+    await runner._attach_branch1_protective(_FakeDB(), manager, _signal("long"), trade)
+
+    assert rec.closed == ["BCHUSDT"]                       # market-closed
+    assert trade.status == "closed"
+    assert trade.extra["close_reason"] == "naked_position_closed"
+    assert trade.extra["exchange_resting_active"] is False
+
+
+async def test_position_kept_when_stop_ok_but_tp_fails():
+    """Stop placed but TP failed -> NOT naked (stop protects) -> do NOT close."""
+    runner = _runner_for_attach()
+    rec = _CloseRecorder()
+    manager = SimpleNamespace(adapter=rec, attach_protective_orders=AsyncMock(
+        return_value=ProtectiveOrdersResult(stop_order_id="stop-1", take_profit_order_id=None,
+                                            elapsed_ms=5.0, success=False, reasons=["tp failed"])))
+    trade = Trade(symbol="ETHUSDT", side="long", entry_price=100.0, stop_loss=99.0,
+                  take_profit={"levels": [101.0]}, status="open", quantity=1.0, setup_name="mr")
+
+    await runner._attach_branch1_protective(_FakeDB(), manager, _signal("long"), trade)
+
+    assert rec.closed == []                                # stop protects -> not closed
+    assert trade.status == "open"
+    assert trade.extra["exchange_resting_active"] is False

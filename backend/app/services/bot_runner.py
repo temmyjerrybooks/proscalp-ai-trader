@@ -1162,6 +1162,23 @@ class BotRunner:
                  "stop_order_id": protective.stop_order_id,
                  "take_profit_order_id": protective.take_profit_order_id},
             )
+            # SAFETY (close-on-attach-fail): if NO stop was placed, the position is
+            # NAKED. Market-close it immediately rather than rely on the loop (which
+            # may be stopped). If a stop DID place but only the TP failed, leave it —
+            # the stop already caps the downside.
+            if protective.stop_order_id is None and self.settings.trading_mode != TradingMode.PAPER:
+                closed_ok = False
+                with suppress(Exception):
+                    await manager.adapter.close_position(trade.symbol)
+                    closed_ok = True
+                trade.status = "closed"
+                trade.closed_at = utc_now()
+                extra["close_reason"] = "naked_position_closed" if closed_ok else "naked_close_failed"
+                await self._risk_event(
+                    db, "warning", "naked_position_closed",
+                    f"stop placement failed; market-close {'OK' if closed_ok else 'ATTEMPT FAILED'} to avoid naked exposure",
+                    {"trade_id": trade.id, "symbol": signal.symbol, "closed": closed_ok},
+                )
         trade.extra = extra
         await self._record_protective_attach_outcome(
             db, protective.success,
